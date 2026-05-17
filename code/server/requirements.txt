@@ -1,0 +1,2 @@
+pyserial>=3.5
+qrcode[pil]>=7.4
