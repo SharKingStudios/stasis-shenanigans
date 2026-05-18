@@ -16,7 +16,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 try:
     import serial
@@ -31,6 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "static" / "audio"
 FONT_DIR = BASE_DIR / "static" / "fonts"
 QR_DIR = BASE_DIR / "static" / "qr"
+LOCAL_AUDIO_MIX_DIR = BASE_DIR / "static" / "audio_mix_cache"
 
 # Localization tuning.
 OBS_TTL_SECONDS = 5.5
@@ -48,7 +49,7 @@ PATH_LOSS_N = 2.2
 # Game tuning.
 MAX_HP = 5
 MAX_MANA = 100
-MANA_REGEN_PER_SEC = 1000.0
+MANA_REGEN_PER_SEC = 10.0
 FIREBALL_COST = 25
 SHIELD_COST = 20
 SHIELD_DURATION_SECONDS = 1.5
@@ -57,11 +58,12 @@ SHIELD_COOLDOWN_SECONDS = 1.25
 SPELL_LOCKOUT_SECONDS = 1.0
 FIREBALL_DAMAGE = 1
 FIREBALL_LENGTH_M = 100.0
-FIREBALL_WIDTH_M = 0.8
-SIMPLE_FIREBALL_RANGE_M = 2.4
+FIREBALL_WIDTH_M = 1.6
+SIMPLE_FIREBALL_RANGE_M = 3.2
 SHIELD_ARC_DEG = 110.0
 WORLD_SEND_INTERVAL = 0.10
 STATE_SEND_INTERVAL = 0.25
+SSE_KEEPALIVE_SECONDS = 2.0
 
 TUNE_PRESETS = {
     "easy": (255, 0.22, 0.45, -0.20, 0.58, 0.22, 0.16, 0.30, 0.0, 0.0, 1.10, 1500),
@@ -85,43 +87,40 @@ FLAG_ALIVE = 1 << 0
 FLAG_SHIELD = 1 << 1
 
 PLAYER_LABELS = {
-    101: "Player 1",
-    102: "Player A",
+    101: "Sol",
+    102: "Luna",
 }
 
 PROP_NAME = "Fan Face"
-PROP_TARGET_RADIUS_M = 0.55
+PROP_TARGET_RADIUS_M = 0.90
 PROP_FAN_MS = 2500
 PROP_FLASH_COUNT = 4
 PROP_FLASH_ON_MS = 120
 PROP_FLASH_OFF_MS = 120
-PROP_LOCAL_AUDIO_DELAY_SECONDS = 0.18
+PROP_LOCAL_AUDIO_DELAY_SECONDS = 0.0
 
-AUDIO_MANIFEST = {
+AUDIO_EXTENSIONS = {".wav", ".mp3", ".ogg", ".m4a"}
+AUDIO_CATEGORY_PREFIXES = {
+    "fireball_core": ("fireball_core", "fireball"),
+    "fireball_voice": ("fireball_voice", "fireball_scream", "fireball_yell"),
+    "shield_core": ("shield_core", "shield"),
+    "shield_voice": ("shield_voice",),
+    "hit": ("hit_bitcrush", "hit", "hurt", "damage"),
+    "block": ("block", "deflect", "parry"),
+    "prop": ("prop_hit", "prop", "fan_face", "fanface"),
+    "denied": ("denied", "fail", "no_mana"),
+}
+DEFAULT_AUDIO_FILES = {
     "fireball_core": ["fireball_core_01.wav"],
-    "fireball_voice": [
-        "fireball_voice_01.wav",
-        "fireball_voice_02.wav",
-        "fireball_voice_03.wav",
-        "fireball_voice_04.wav",
-    ],
+    "fireball_voice": ["fireball_voice_01.wav", "fireball_voice_02.wav", "fireball_voice_03.wav", "fireball_voice_04.wav"],
     "shield_core": ["shield_core_01.wav"],
-    "shield_voice": [
-        "shield_voice_01.wav",
-        "shield_voice_02.wav",
-        "shield_voice_03.wav",
-    ],
+    "shield_voice": ["shield_voice_01.wav", "shield_voice_02.wav", "shield_voice_03.wav"],
     "hit": ["hit_bitcrush_01.wav"],
     "block": ["block_01.wav"],
-    "prop": [
-        "prop_hit_01.wav",
-        "prop_hit_02.wav",
-        "prop_hit_03.wav",
-        "prop_hit_04.wav",
-        "prop_hit_05.wav",
-    ],
+    "prop": ["prop_hit_01.wav", "prop_hit_02.wav", "prop_hit_03.wav", "prop_hit_04.wav", "prop_hit_05.wav"],
     "denied": ["denied_01.wav"],
 }
+AUDIO_MANIFEST = {category: [] for category in AUDIO_CATEGORY_PREFIXES}
 
 EDG = {
     "ember": "#be4a2f",
@@ -233,6 +232,7 @@ class VisualEvent:
     end: tuple | None = None
     blocked: bool = False
     prop_hit: bool = False
+    hp_loss: int = 0
 
 
 def player_label(player_id):
@@ -307,32 +307,46 @@ class PhoneAudioHub:
         self.lock = threading.Lock()
         self.sequence = 1
 
-    def subscribe(self):
+    def subscribe(self, player_id=0):
         client_queue = queue.Queue(maxsize=32)
         with self.lock:
-            self.clients.append(client_queue)
+            self.clients.append({"queue": client_queue, "player_id": player_id, "last_seen": time.time()})
         return client_queue
 
     def unsubscribe(self, client_queue):
         with self.lock:
-            if client_queue in self.clients:
-                self.clients.remove(client_queue)
+            self.clients = [client for client in self.clients if client["queue"] is not client_queue]
 
-    def client_count(self):
+    def client_count(self, player_id=None):
         with self.lock:
-            return len(self.clients)
+            if player_id is None:
+                return len(self.clients)
+            return sum(1 for client in self.clients if client["player_id"] == player_id)
 
-    def broadcast(self, payload):
+    def client_summary(self):
+        with self.lock:
+            counts = {}
+            for client in self.clients:
+                counts[client["player_id"]] = counts.get(client["player_id"], 0) + 1
+            return counts
+
+    def broadcast(self, payload, audience_player_id=0):
         payload = dict(payload)
         payload["eventSeq"] = self.sequence
         self.sequence = (self.sequence + 1) & 0xFFFF
         with self.lock:
-            clients = list(self.clients)
+            clients = [
+                client for client in self.clients
+                if audience_player_id == 0 or client["player_id"] == audience_player_id
+            ]
+        delivered = 0
         for client in clients:
             try:
-                client.put_nowait(payload)
+                client["queue"].put_nowait(payload)
+                delivered += 1
             except queue.Full:
                 pass
+        return delivered
 
 
 PHONE_PAGE_HTML = r"""<!doctype html>
@@ -368,8 +382,8 @@ PHONE_PAGE_HTML = r"""<!doctype html>
     <p id="lead">Loading spell audio...</p>
     <div class="bar"><div id="fill" class="fill"></div></div>
     <div class="choice">
-      <button id="choose101" type="button">Player 1</button>
-      <button id="choose102" type="button">Player A</button>
+      <button id="choose101" type="button">Sol</button>
+      <button id="choose102" type="button">Luna</button>
     </div>
     <button id="arm">Tap to arm audio</button>
     <div class="status">
@@ -395,19 +409,20 @@ PHONE_PAGE_HTML = r"""<!doctype html>
     const last = document.getElementById('last');
     const choose101 = document.getElementById('choose101');
     const choose102 = document.getElementById('choose102');
-    let ctx, manifest, buffers = {}, eventCount = 0, armed = false, wakeLock = null;
+    let ctx, manifest, buffers = {}, eventCount = 0, armed = false, wakeLock = null, es = null;
     let selectedPlayer = Number(localStorage.getItem('spellArenaPlayer') || 0);
 
     function updatePlayerChoice() {
       choose101.classList.toggle('selected', selectedPlayer === 101);
       choose102.classList.toggle('selected', selectedPlayer === 102);
-      playerChoiceState.textContent = selectedPlayer === 101 ? 'Player 1' : (selectedPlayer === 102 ? 'Player A' : 'choose');
+      playerChoiceState.textContent = selectedPlayer === 101 ? 'Sol' : (selectedPlayer === 102 ? 'Luna' : 'choose');
     }
 
     function choosePlayer(id) {
       selectedPlayer = id;
       localStorage.setItem('spellArenaPlayer', String(id));
       updatePlayerChoice();
+      connectEvents();
     }
 
     choose101.addEventListener('click', () => choosePlayer(101));
@@ -416,19 +431,21 @@ PHONE_PAGE_HTML = r"""<!doctype html>
 
     async function loadAudio() {
       manifest = await fetch('/manifest.json').then(r => r.json());
+      const assetVersion = manifest.version || Date.now();
+      const assetUrl = file => '/audio/' + encodeURIComponent(file) + '?v=' + encodeURIComponent(assetVersion);
       const files = Object.values(manifest.assets).flat();
       if ('caches' in window) {
-        const cache = await caches.open('spell-arena-audio-v1');
-        await cache.addAll(files.map(f => '/audio/' + f));
+        const cache = await caches.open('spell-arena-audio-' + assetVersion);
+        await cache.addAll(files.map(assetUrl));
       }
       ctx = new (window.AudioContext || window.webkitAudioContext)();
       for (let i = 0; i < files.length; i++) {
         const file = files[i];
-        const data = await fetch('/audio/' + file).then(r => r.arrayBuffer());
+        const data = await fetch(assetUrl(file), {cache: 'reload'}).then(r => r.arrayBuffer());
         buffers[file] = await ctx.decodeAudioData(data);
         fill.style.width = Math.round(((i + 1) / files.length) * 100) + '%';
       }
-      lead.textContent = 'Audio cached. Tap once before the duel starts.';
+      lead.textContent = selectedPlayer ? 'Audio cached. Tap once before the duel starts.' : 'Choose your player, then tap to arm audio.';
       audioState.textContent = 'cached';
     }
 
@@ -467,29 +484,25 @@ PHONE_PAGE_HTML = r"""<!doctype html>
     }
 
     function handleAudio(event) {
-      const audience = event.type === 'fireball_cast' || event.type === 'shield_cast' || event.type === 'denied'
-        ? event.casterId
-        : (event.type === 'hit' || event.type === 'block' ? event.targetId : 0);
       if (event.type === 'prop_hit') return;
-      if (!selectedPlayer || audience !== selectedPlayer) return;
       eventCount++;
       eventState.textContent = String(eventCount);
       last.textContent = `${event.casterLabel || 'Arena'} ${event.type.replace('_', ' ')} ${event.targetLabel || ''}`.trim();
       const a = manifest.assets;
       if (event.type === 'fireball_cast') {
-        playFile(pick(a.fireball_core, 0), event.corePitch, 0.85);
-        playFile(pick(a.fireball_voice, event.voiceIndex), event.voicePitch, 0.75, 0.02);
+        playFile(pick(a.fireball_core, event.coreIndex), event.corePitch, 0.55);
+        playFile(pick(a.fireball_voice, event.voiceIndex), event.voicePitch, 1.0);
       } else if (event.type === 'shield_cast') {
-        playFile(pick(a.shield_core, 0), event.corePitch, 0.8);
-        playFile(pick(a.shield_voice, event.voiceIndex), event.voicePitch, 0.65, 0.03);
+        playFile(pick(a.shield_core, event.coreIndex), event.corePitch, 0.55);
+        playFile(pick(a.shield_voice, event.voiceIndex), event.voicePitch, 0.95);
       } else if (event.type === 'hit') {
-        playFile(pick(a.hit, 0), event.corePitch, 1.0);
+        playFile(pick(a.hit, event.coreIndex), event.corePitch, 1.0);
       } else if (event.type === 'block') {
-        playFile(pick(a.block, 0), event.corePitch, 1.0);
+        playFile(pick(a.block, event.coreIndex), event.corePitch, 1.0);
       } else if (event.type === 'prop_hit') {
-        playFile(pick(a.prop, 0), event.corePitch, 1.0);
+        playFile(pick(a.prop, event.coreIndex), event.corePitch, 1.0);
       } else if (event.type === 'denied') {
-        playFile(pick(a.denied, 0), event.corePitch, 0.8);
+        playFile(pick(a.denied, event.coreIndex), event.corePitch, 0.8);
       }
     }
 
@@ -508,7 +521,13 @@ PHONE_PAGE_HTML = r"""<!doctype html>
     });
 
     function connectEvents() {
-      const es = new EventSource('/events');
+      if (!manifest) return;
+      if (!selectedPlayer) {
+        serverState.textContent = 'choose player';
+        return;
+      }
+      if (es) es.close();
+      es = new EventSource('/events?player=' + encodeURIComponent(selectedPlayer));
       es.onopen = () => serverState.textContent = 'connected';
       es.onerror = () => serverState.textContent = 'reconnecting';
       es.addEventListener('audio', e => handleAudio(JSON.parse(e.data)));
@@ -525,8 +544,66 @@ PHONE_PAGE_HTML = r"""<!doctype html>
 """
 
 
+def audio_category_for_filename(filename):
+    stem = Path(filename).stem.lower()
+    matches = []
+    for category, prefixes in AUDIO_CATEGORY_PREFIXES.items():
+        for prefix in prefixes:
+            if stem == prefix or stem.startswith(prefix + "_") or stem.startswith(prefix + "-"):
+                matches.append((len(prefix), category))
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
+def scan_audio_manifest():
+    manifest = {category: [] for category in AUDIO_CATEGORY_PREFIXES}
+    if not AUDIO_DIR.exists():
+        return manifest
+    for path in sorted(AUDIO_DIR.iterdir(), key=lambda p: p.name.lower()):
+        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        category = audio_category_for_filename(path.name)
+        if category:
+            manifest[category].append(path.name)
+    return manifest
+
+
+def refresh_audio_manifest():
+    global AUDIO_MANIFEST
+    AUDIO_MANIFEST = scan_audio_manifest()
+    return AUDIO_MANIFEST
+
+
+def audio_manifest_version():
+    latest = 0
+    total_size = 0
+    for files in AUDIO_MANIFEST.values():
+        for filename in files:
+            path = AUDIO_DIR / filename
+            if path.exists():
+                stat = path.stat()
+                latest = max(latest, stat.st_mtime_ns)
+                total_size += stat.st_size
+    return f"{latest:x}-{total_size:x}"
+
+
+def audio_content_type(path):
+    suffix = path.suffix.lower()
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".ogg":
+        return "audio/ogg"
+    if suffix == ".m4a":
+        return "audio/mp4"
+    return "audio/wav"
+
+
 def ensure_audio_assets():
+    global AUDIO_MANIFEST
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+    existing = scan_audio_manifest()
     generators = {
         "fireball_core_01.wav": lambda p: write_sfx(p, "fireball_core", 0.75),
         "shield_core_01.wav": lambda p: write_sfx(p, "shield_core", 0.65),
@@ -534,17 +611,23 @@ def ensure_audio_assets():
         "block_01.wav": lambda p: write_sfx(p, "block", 0.48),
         "denied_01.wav": lambda p: write_sfx(p, "denied", 0.26),
     }
-    for i, name in enumerate(AUDIO_MANIFEST["prop"], start=1):
+    for i, name in enumerate(DEFAULT_AUDIO_FILES["prop"], start=1):
         generators[name] = lambda p, idx=i: write_sfx(p, "prop", 0.95, idx)
-    for i, name in enumerate(AUDIO_MANIFEST["fireball_voice"], start=1):
+    for i, name in enumerate(DEFAULT_AUDIO_FILES["fireball_voice"], start=1):
         generators[name] = lambda p, idx=i: write_sfx(p, "fireball_voice", 0.55, idx)
-    for i, name in enumerate(AUDIO_MANIFEST["shield_voice"], start=1):
+    for i, name in enumerate(DEFAULT_AUDIO_FILES["shield_voice"], start=1):
         generators[name] = lambda p, idx=i: write_sfx(p, "shield_voice", 0.52, idx)
 
-    for filename, generator in generators.items():
-        path = AUDIO_DIR / filename
-        if not path.exists():
-            generator(path)
+    for category, defaults in DEFAULT_AUDIO_FILES.items():
+        if existing.get(category):
+            continue
+        for filename in defaults:
+            path = AUDIO_DIR / filename
+            generator = generators.get(filename)
+            if generator and not path.exists():
+                generator(path)
+
+    refresh_audio_manifest()
 
 
 def write_sfx(path, kind, seconds, variant=1):
@@ -602,7 +685,8 @@ def make_phone_handler(audio_hub):
             if path == "/":
                 self.send_bytes(PHONE_PAGE_HTML.encode("utf-8"), "text/html; charset=utf-8")
             elif path == "/manifest.json":
-                body = json.dumps({"assets": AUDIO_MANIFEST}).encode("utf-8")
+                manifest = refresh_audio_manifest()
+                body = json.dumps({"assets": manifest, "version": audio_manifest_version()}).encode("utf-8")
                 self.send_bytes(body, "application/json")
             elif path == "/events":
                 self.serve_events()
@@ -627,7 +711,7 @@ def make_phone_handler(audio_hub):
             if not path.exists():
                 self.send_error(404)
                 return
-            self.send_bytes(path.read_bytes(), "audio/wav")
+            self.send_bytes(path.read_bytes(), audio_content_type(path))
 
         def serve_font(self, filename):
             filename = os.path.basename(unquote(filename))
@@ -639,7 +723,13 @@ def make_phone_handler(audio_hub):
             self.send_bytes(path.read_bytes(), content_type)
 
         def serve_events(self):
-            client = audio_hub.subscribe()
+            parsed = urlparse(self.path)
+            params = parse_qs(parsed.query)
+            try:
+                player_id = int(params.get("player", ["0"])[0])
+            except (TypeError, ValueError):
+                player_id = 0
+            client = audio_hub.subscribe(player_id)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -650,7 +740,7 @@ def make_phone_handler(audio_hub):
                 self.wfile.flush()
                 while True:
                     try:
-                        payload = client.get(timeout=15.0)
+                        payload = client.get(timeout=SSE_KEEPALIVE_SECONDS)
                         line = f"event: audio\ndata: {json.dumps(payload)}\n\n".encode("utf-8")
                     except queue.Empty:
                         line = b": keepalive\n\n"
@@ -681,30 +771,171 @@ class LocalAudioPlayer:
     def __init__(self):
         self.enabled = os.name == "nt"
         self._winsound = None
+        self._winmm = None
+        self._mci_counter = 0
+        self._mci_lock = threading.Lock()
         if self.enabled:
             try:
                 import winsound
                 self._winsound = winsound
+                self._winmm = ctypes.windll.winmm
             except ImportError:
                 self.enabled = False
 
-    def play_prop(self, delay_seconds=PROP_LOCAL_AUDIO_DELAY_SECONDS):
+    def mci_send(self, command):
+        if self._winmm is None:
+            return 1
+        return self._winmm.mciSendStringW(command, None, 0, None)
+
+    def wav_duration_seconds(self, path):
+        try:
+            with wave.open(str(path), "rb") as wav:
+                return wav.getnframes() / max(1, wav.getframerate())
+        except (wave.Error, OSError):
+            return 1.0
+
+    def playable_files(self, category):
+        files = []
+        for name in AUDIO_MANIFEST.get(category, []):
+            path = AUDIO_DIR / name
+            if path.exists() and path.suffix.lower() == ".wav":
+                files.append(path)
+        return files
+
+    def read_wav_samples(self, path):
+        try:
+            with wave.open(str(path), "rb") as wav:
+                channels = wav.getnchannels()
+                sample_width = wav.getsampwidth()
+                rate = wav.getframerate()
+                frame_count = wav.getnframes()
+                raw = wav.readframes(frame_count)
+        except (wave.Error, OSError):
+            return None, []
+
+        if sample_width == 2:
+            count = len(raw) // 2
+            values = struct.unpack("<" + "h" * count, raw)
+            scale = 32768.0
+        elif sample_width == 1:
+            values = [byte - 128 for byte in raw]
+            scale = 128.0
+        else:
+            return None, []
+
+        samples = []
+        for i in range(0, len(values), channels):
+            frame = values[i:i + channels]
+            samples.append(sum(frame) / (scale * max(1, len(frame))))
+        return rate, samples
+
+    def resample(self, samples, source_rate, target_rate):
+        if not samples or source_rate == target_rate:
+            return samples
+        ratio = source_rate / target_rate
+        out_len = max(1, int(len(samples) / ratio))
+        return [samples[min(len(samples) - 1, int(i * ratio))] for i in range(out_len)]
+
+    def write_mixed_wav(self, core_path, voice_path, event_type):
+        core_rate, core = self.read_wav_samples(core_path)
+        voice_rate, voice = self.read_wav_samples(voice_path)
+        if not core_rate or not voice_rate or not core or not voice:
+            return None
+
+        target_rate = max(core_rate, voice_rate)
+        core = self.resample(core, core_rate, target_rate)
+        voice = self.resample(voice, voice_rate, target_rate)
+        voice_delay = 0
+        total = max(len(core), voice_delay + len(voice))
+        mixed = [0.0] * total
+
+        for i, sample in enumerate(core):
+            mixed[i] += sample * 0.50
+        for i, sample in enumerate(voice):
+            mixed[voice_delay + i] += sample * 1.05
+
+        peak = max(0.01, max(abs(sample) for sample in mixed))
+        if peak > 0.98:
+            mixed = [sample * 0.98 / peak for sample in mixed]
+
+        LOCAL_AUDIO_MIX_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = int(time.time() * 1000)
+        path = LOCAL_AUDIO_MIX_DIR / f"{event_type}_{stamp}.wav"
+        with wave.open(str(path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(target_rate)
+            wav.writeframes(b"".join(
+                struct.pack("<h", int(max(-1.0, min(1.0, sample)) * 32767))
+                for sample in mixed
+            ))
+        return path
+
+    def play_file(self, path):
+        with self._mci_lock:
+            self._mci_counter += 1
+            alias = f"spellarena_{self._mci_counter}"
+
+        safe_path = str(path).replace('"', '')
+        opened = self.mci_send(f'open "{safe_path}" type waveaudio alias {alias}') == 0
+        if opened and self.mci_send(f"play {alias}") == 0:
+            duration = self.wav_duration_seconds(path)
+            threading.Timer(duration + 0.45, self.mci_send, args=(f"close {alias}",)).start()
+            return
+        if opened:
+            self.mci_send(f"close {alias}")
+
+        try:
+            self._winsound.PlaySound(str(path), self._winsound.SND_FILENAME | self._winsound.SND_ASYNC)
+        except RuntimeError:
+            pass
+
+    def play_cast_mix(self, core_category, voice_category, event_type):
+        core_files = self.playable_files(core_category)
+        voice_files = self.playable_files(voice_category)
+        if not core_files and not voice_files:
+            return
+        if core_files and voice_files:
+            mixed = self.write_mixed_wav(random.choice(core_files), random.choice(voice_files), event_type)
+            if mixed:
+                self.play_file(mixed)
+                return
+        self.play_file(random.choice(voice_files or core_files))
+
+    def play_category(self, category, delay_seconds=0.0):
         if not self.enabled or self._winsound is None:
             return
         if delay_seconds > 0:
-            threading.Timer(delay_seconds, self.play_prop, kwargs={"delay_seconds": 0}).start()
+            threading.Timer(delay_seconds, self.play_category, args=(category,), kwargs={"delay_seconds": 0}).start()
             return
-        files = [AUDIO_DIR / name for name in AUDIO_MANIFEST["prop"]]
-        files = [path for path in files if path.exists()]
+        files = self.playable_files(category)
         if not files:
             return
-        try:
-            self._winsound.PlaySound(
-                str(random.choice(files)),
-                self._winsound.SND_FILENAME | self._winsound.SND_ASYNC,
-            )
-        except RuntimeError:
-            pass
+        self.play_file(random.choice(files))
+
+    def play_event(self, event_type, delay_seconds=0.0):
+        if not self.enabled or self._winsound is None:
+            return
+        if delay_seconds > 0:
+            threading.Timer(delay_seconds, self.play_event, args=(event_type,), kwargs={"delay_seconds": 0}).start()
+            return
+        if event_type == "fireball_cast":
+            self.play_cast_mix("fireball_core", "fireball_voice", event_type)
+            return
+        if event_type == "shield_cast":
+            self.play_cast_mix("shield_core", "shield_voice", event_type)
+            return
+        category = {
+            "hit": "hit",
+            "block": "block",
+            "prop_hit": "prop",
+            "denied": "denied",
+        }.get(event_type)
+        if category:
+            self.play_category(category, delay_seconds=delay_seconds)
+
+    def play_prop(self, delay_seconds=PROP_LOCAL_AUDIO_DELAY_SECONDS):
+        self.play_event("prop_hit", delay_seconds=delay_seconds)
 
 
 class LinkFilter:
@@ -1049,13 +1280,15 @@ class MeshSolver:
 
 
 class GameEngine:
-    def __init__(self, outgoing, simple_combat=False, audio_hub=None, local_audio=None, prop_position_getter=None):
+    def __init__(self, outgoing, simple_combat=False, audio_hub=None, local_audio=None,
+                 local_audio_mode="all", prop_position_getter=None):
         self.players = {}
         self.events = deque(maxlen=24)
         self.outgoing = outgoing
         self.simple_combat = simple_combat
         self.audio_hub = audio_hub
         self.local_audio = local_audio
+        self.local_audio_mode = local_audio_mode
         self.prop_position_getter = prop_position_getter or (lambda: (0.0, 0.0))
         self.last_world_sent_at = 0.0
         self.world_sequence = 0
@@ -1230,6 +1463,7 @@ class GameEngine:
             target_id=target.player_id,
             start=start,
             end=(target.x, target.y),
+            hp_loss=FIREBALL_DAMAGE,
         )
         self.broadcast_audio("hit", caster_id=caster.player_id, target_id=target.player_id)
         self.send_state(caster, EVENT_NONE)
@@ -1257,8 +1491,6 @@ class GameEngine:
             end=prop_pos,
             prop_hit=True,
         )
-        if self.local_audio:
-            self.local_audio.play_prop()
         self.broadcast_audio("prop_hit", caster_id=caster.player_id, target_label=PROP_NAME)
         self.send_state(caster, EVENT_NONE)
 
@@ -1278,25 +1510,30 @@ class GameEngine:
         self.broadcast_audio("denied", caster_id=player.player_id)
         self.send_state(player, EVENT_DENIED)
 
-    def add_event(self, text, event_type, caster_id=0, target_id=0, start=None, end=None, blocked=False, prop_hit=False):
+    def add_event(self, text, event_type, caster_id=0, target_id=0, start=None, end=None,
+                  blocked=False, prop_hit=False, hp_loss=0):
         now = time.time()
+        duration = 2.6 if event_type in (EVENT_HIT, EVENT_DEATH) else 2.0
         self.events.append(VisualEvent(
             text=text,
             event_type=event_type,
             created_at=now,
-            expires_at=now + 2.0,
+            expires_at=now + duration,
             caster_id=caster_id,
             target_id=target_id,
             start=start,
             end=end,
             blocked=blocked,
             prop_hit=prop_hit or event_type == EVENT_PROP_HIT,
+            hp_loss=hp_loss,
         ))
 
     def broadcast_audio(self, event_type, caster_id=0, target_id=0, target_label=None):
-        if self.audio_hub is None:
-            return
-        voice_pool = 4 if event_type == "fireball_cast" else 3
+        refresh_audio_manifest()
+        audience_player_id = self.audio_audience_player(event_type, caster_id, target_id)
+        voice_category = "fireball_voice" if event_type == "fireball_cast" else "shield_voice"
+        voice_pool = max(1, len(AUDIO_MANIFEST.get(voice_category, [])))
+        core_pool = max(1, len(AUDIO_MANIFEST.get(self.audio_core_category(event_type), [])))
         payload = {
             "type": event_type,
             "casterId": caster_id,
@@ -1305,9 +1542,45 @@ class GameEngine:
             "targetLabel": target_label or (player_label(target_id) if target_id else ""),
             "corePitch": audio_pitch(0.86, 1.18),
             "voicePitch": audio_pitch(0.93, 1.08),
+            "coreIndex": random.randrange(core_pool),
             "voiceIndex": random.randrange(voice_pool),
         }
-        self.audio_hub.broadcast(payload)
+        delivered = 0
+        if self.audio_hub is not None and event_type != "prop_hit":
+            delivered = self.audio_hub.broadcast(payload, audience_player_id=audience_player_id)
+        if self.should_play_local_audio(event_type, audience_player_id, delivered):
+            self.local_audio.play_event(event_type, delay_seconds=self.local_audio_delay(event_type))
+
+    def should_play_local_audio(self, event_type, audience_player_id, delivered):
+        if not self.local_audio or self.local_audio_mode == "off":
+            return False
+        if self.local_audio_mode == "all":
+            return True
+        return event_type == "prop_hit" or (audience_player_id and delivered == 0)
+
+    def local_audio_delay(self, event_type):
+        if event_type in ("hit", "block"):
+            return 0.20
+        if event_type == "prop_hit":
+            return PROP_LOCAL_AUDIO_DELAY_SECONDS
+        return 0.0
+
+    def audio_audience_player(self, event_type, caster_id, target_id):
+        if event_type in ("fireball_cast", "shield_cast", "denied"):
+            return caster_id
+        if event_type in ("hit", "block"):
+            return target_id
+        return 0
+
+    def audio_core_category(self, event_type):
+        return {
+            "fireball_cast": "fireball_core",
+            "shield_cast": "shield_core",
+            "hit": "hit",
+            "block": "block",
+            "prop_hit": "prop",
+            "denied": "denied",
+        }.get(event_type, "hit")
 
     def trigger_prop_test(self):
         self.outgoing.put(
@@ -1315,8 +1588,6 @@ class GameEngine:
         )
         self.prop_sequence = (self.prop_sequence + 1) & 0xFFFF
         self.add_event(f"{PROP_NAME} test", EVENT_PROP_HIT, end=self.prop_position(), prop_hit=True)
-        if self.local_audio:
-            self.local_audio.play_prop()
         self.broadcast_audio("prop_hit", target_label=PROP_NAME)
 
     def trigger_audio_test(self, event_type):
@@ -1329,8 +1600,6 @@ class GameEngine:
             "denied": "denied",
         }.get(event_type)
         if mapped:
-            if mapped == "prop_hit" and self.local_audio:
-                self.local_audio.play_prop()
             self.broadcast_audio(mapped, caster_id=101, target_id=102 if mapped in ("hit", "block") else 0,
                                  target_label=PROP_NAME if mapped == "prop_hit" else None)
 
@@ -1376,35 +1645,115 @@ class GameEngine:
 
 class SerialTransport:
     def __init__(self, port_name, baud, incoming, outgoing):
-        self.port_name = normalize_port_name(port_name)
+        self.requested_port_name = normalize_port_name(port_name)
+        self.port_name = self.requested_port_name
         self.baud = baud
         self.incoming = incoming
         self.outgoing = outgoing
+        self.control_backlog = deque(maxlen=120)
+        self.pending_states = {}
+        self.pending_world = None
+
+    def resolve_port(self):
+        if self.requested_port_name:
+            return self.requested_port_name
+        return choose_port()
+
+    def remember_line(self, line, front=False):
+        if not line:
+            return
+        if line.startswith("WORLD,"):
+            self.pending_world = line
+            return
+        if line.startswith("STATE,"):
+            parts = line.split(",", 3)
+            if len(parts) >= 3:
+                self.pending_states[parts[1]] = line
+                return
+        if front:
+            self.control_backlog.appendleft(line)
+        else:
+            self.control_backlog.append(line)
+
+    def absorb_outgoing(self):
+        while True:
+            try:
+                self.remember_line(self.outgoing.get_nowait())
+            except queue.Empty:
+                return
+
+    def next_pending_line(self):
+        if self.control_backlog:
+            return self.control_backlog.popleft()
+        if self.pending_states:
+            key = sorted(self.pending_states.keys())[0]
+            return self.pending_states.pop(key)
+        if self.pending_world:
+            line = self.pending_world
+            self.pending_world = None
+            return line
+        return None
+
+    def pending_count(self):
+        return len(self.control_backlog) + len(self.pending_states) + (1 if self.pending_world else 0)
 
     def run(self):
-        try:
-            with serial.Serial(self.port_name, self.baud, timeout=0.02, write_timeout=0.02) as ser:
-                time.sleep(1.0)
-                self.incoming.put(f"CONNECTED,{self.port_name},{self.baud}")
-                while True:
-                    try:
-                        while True:
-                            line = self.outgoing.get_nowait()
-                            ser.write((line + "\n").encode("utf-8"))
-                    except queue.Empty:
-                        pass
+        backoff = 0.35
+        while True:
+            self.absorb_outgoing()
+            port_name = self.resolve_port()
+            if port_name is None:
+                self.incoming.put("SERIAL_WAITING,no_ports")
+                time.sleep(min(2.0, backoff))
+                backoff = min(2.0, backoff * 1.35)
+                continue
 
-                    raw = ser.readline()
-                    if raw:
-                        self.incoming.put(raw.decode("utf-8", errors="replace").strip())
-        except Exception as exc:
-            message = f"Serial error on {self.port_name}: {exc}"
-            if "access is denied" in str(exc).lower() or "permission" in str(exc).lower():
-                message += " | Close Arduino Serial Monitor/Plotter or another server using this COM port."
-            if "file not found" in str(exc).lower() or "cannot find" in str(exc).lower():
-                message += " | Run with --list-ports and use a listed name like COM4."
-            print(message)
-            self.incoming.put(message)
+            self.port_name = port_name
+            try:
+                with serial.Serial(port_name, self.baud, timeout=0.04, write_timeout=0.50) as ser:
+                    time.sleep(0.85)
+                    try:
+                        ser.reset_output_buffer()
+                    except Exception:
+                        pass
+                    self.incoming.put(f"CONNECTED,{port_name},{self.baud}")
+                    backoff = 0.35
+                    last_flush_at = 0.0
+
+                    while True:
+                        self.absorb_outgoing()
+
+                        sent = 0
+                        while sent < 20:
+                            line = self.next_pending_line()
+                            if line is None:
+                                break
+                            try:
+                                ser.write((line + "\n").encode("utf-8"))
+                                sent += 1
+                            except Exception:
+                                self.remember_line(line, front=not line.startswith(("STATE,", "WORLD,")))
+                                raise
+
+                        now = time.time()
+                        if sent and now - last_flush_at > 1.0:
+                            last_flush_at = now
+
+                        raw = ser.readline()
+                        if raw:
+                            self.incoming.put(raw.decode("utf-8", errors="replace").strip())
+            except Exception as exc:
+                self.absorb_outgoing()
+                message = f"Serial reconnecting on {port_name}: {exc}"
+                if "access is denied" in str(exc).lower() or "permission" in str(exc).lower():
+                    message += " | Close Arduino Serial Monitor/Plotter or another server using this COM port."
+                if "file not found" in str(exc).lower() or "cannot find" in str(exc).lower():
+                    message += " | Waiting for the bridge COM port to come back."
+                message += f" | queued={self.pending_count()}"
+                print(message)
+                self.incoming.put(f"SERIAL_DOWN,{port_name},{self.pending_count()}")
+                time.sleep(backoff)
+                backoff = min(2.0, backoff * 1.4)
 
 
 class FakeTransport:
@@ -1478,8 +1827,10 @@ class CommandConsole:
         print("  recenter [target]")
         print("  prop test")
         print("  sound test fireball|shield|hit|block|prop|denied")
+        print("  audio rescan")
         print("  clients")
         print("  qr")
+        print("  hotspot")
 
     def handle(self, line):
         if not line:
@@ -1502,8 +1853,18 @@ class CommandConsole:
             self.game.trigger_audio_test(parts[2].lower())
             print(f"sent sound test {parts[2].lower()}")
             return
+        if command == "audio" and len(parts) >= 2 and parts[1].lower() == "rescan":
+            manifest = refresh_audio_manifest()
+            print("audio files:")
+            for category, files in manifest.items():
+                print(f"  {category}: {len(files)}")
+            return
         if command == "clients":
-            print(f"phone audio clients: {self.audio_hub.client_count()}")
+            summary = self.audio_hub.client_summary()
+            p1 = summary.get(101, 0)
+            pa = summary.get(102, 0)
+            other = sum(count for player_id, count in summary.items() if player_id not in (101, 102))
+            print(f"phone audio clients: total={self.audio_hub.client_count()} Sol={p1} Luna={pa} other={other}")
             return
         if command == "qr":
             print(f"phone URL: {self.phone_url}")
@@ -1511,6 +1872,14 @@ class CommandConsole:
                 print(f"wifi SSID: {self.wifi_ssid}")
             else:
                 print("wifi QR disabled: pass --wifi-ssid and --wifi-password")
+            return
+        if command == "hotspot":
+            print("Windows hotspot survival checklist:")
+            print("  1. Plug laptop into power and set Power mode to Best performance.")
+            print("  2. Device Manager > Wi-Fi adapter > Power Management > uncheck 'Allow the computer to turn off this device'.")
+            print("  3. If available, set the hotspot band to 2.4 GHz for range/stability.")
+            print("  4. Keep phone screens awake; the server now falls back to laptop audio when a player's phone is gone.")
+            print("  5. Run the server as close to the arena as possible; avoid USB3 hubs beside the ESP32/2.4 GHz radios.")
             return
         if command != "tune":
             print("unknown command; type help")
@@ -1547,7 +1916,7 @@ class CommandConsole:
 
 class MapApp:
     def __init__(self, root, solver, game, incoming, outgoing, port_name,
-                 phone_url, audio_hub, wifi_ssid=None, wifi_password=None):
+                 phone_url, audio_hub, wifi_ssid=None, wifi_password=None, flip_map_y=False):
         self.root = root
         self.solver = solver
         self.game = game
@@ -1558,6 +1927,7 @@ class MapApp:
         self.audio_hub = audio_hub
         self.wifi_ssid = wifi_ssid
         self.wifi_password = wifi_password
+        self.flip_map_y = flip_map_y
         self.last_status = "Waiting for radio data..."
         self.title_font = "Press Start 2P"
         self.body_font = "Pixelify Sans"
@@ -1621,6 +1991,7 @@ class MapApp:
         hud_h = 190
         self.draw_player_hud(18, 18, hud_w, hud_h, self.game.players.get(101), 101, EDG["orange"], "left")
         self.draw_player_hud(width - hud_w - 18, 18, hud_w, hud_h, self.game.players.get(102), 102, EDG["cyan"], "right")
+        self.draw_hud_damage_bursts(width, hud_w)
 
     def screen_mapper(self, rect, top_reserved=220):
         x0, y0, x1, y1 = rect
@@ -1642,7 +2013,10 @@ class MapApp:
         def screen(point):
             x, y = point
             sx = x0 + 26 + (x - min_x) * scale
-            sy = y1 - 26 - (y - min_y) * scale
+            if self.flip_map_y:
+                sy = y0 + top_reserved + 26 + (y - min_y) * scale
+            else:
+                sy = y1 - 26 - (y - min_y) * scale
             return sx, sy
 
         return screen, (min_x, max_x, min_y, max_y)
@@ -1695,6 +2069,13 @@ class MapApp:
                 x, y = screen(event.end)
                 radius = 20 + int((1.0 - frac) * 54)
                 self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=EDG["yellow"], width=3)
+            if event.hp_loss and event.end:
+                x, y = screen(event.end)
+                progress = 1.0 - frac
+                radius = 34 + int(progress * 70)
+                color = EDG["yellow"] if progress < 0.45 else EDG["ember"]
+                self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=color, width=5)
+                self.canvas.create_text(x, y - 66 - progress * 24, text="-HP", fill=EDG["red"], font=(self.title_font, 15))
 
     def draw_fields(self, screen):
         health = self.solver.field_health()
@@ -1726,7 +2107,8 @@ class MapApp:
             self.canvas.create_oval(x - 17, y - 17, x + 17, y + 17, fill=color, outline=EDG["void"], width=2)
             self.canvas.create_oval(x - 26, y - 26, x + 26, y + 26, outline=color, width=2)
             dx, dy = yaw_to_vec(player.yaw_deg)
-            self.canvas.create_line(x, y, x + dx * 45, y - dy * 45, fill=EDG["white"], width=4, arrow=tk.LAST)
+            ax, ay = screen((player.x + dx * 0.45, player.y + dy * 0.45))
+            self.canvas.create_line(x, y, ax, ay, fill=EDG["white"], width=4, arrow=tk.LAST)
             self.canvas.create_text(x, y - 38, text=player_label(player_id).upper(), fill=EDG["white"], font=(self.body_font, 12, "bold"))
 
     def draw_shield_cone(self, screen, player):
@@ -1775,6 +2157,52 @@ class MapApp:
         self.canvas.create_rectangle(x, y + 22, x + w, y + 40, fill=EDG["navy"], outline=EDG["slate"])
         if frac > 0:
             self.canvas.create_rectangle(x + 2, y + 24, x + 2 + (w - 4) * frac, y + 38, fill=color, outline="")
+
+    def hud_damage_block_rect(self, width, hud_w, player_id, hp_after):
+        hud_h = 190
+        if player_id == 101:
+            x = 18
+        elif player_id == 102:
+            x = width - hud_w - 18
+        else:
+            return None
+        y = 18
+        hp_x = x + 18
+        hp_y = y + 48
+        hp_w = hud_w - 36
+        block_w = (hp_w - 16) / MAX_HP
+        index = max(0, min(MAX_HP - 1, hp_after))
+        bx = hp_x + index * (block_w + 4)
+        return bx, hp_y + 24, bx + block_w, hp_y + 48
+
+    def draw_hud_damage_bursts(self, width, hud_w):
+        now = time.time()
+        for event in list(self.game.events):
+            if not event.hp_loss or event.expires_at <= now:
+                continue
+            player = self.game.players.get(event.target_id)
+            if player is None:
+                continue
+            rect = self.hud_damage_block_rect(width, hud_w, event.target_id, player.hp)
+            if rect is None:
+                continue
+            x0, y0, x1, y1 = rect
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            duration = max(0.1, event.expires_at - event.created_at)
+            progress = max(0.0, min(1.0, (now - event.created_at) / duration))
+            fade_color = EDG["red"] if progress < 0.35 else (EDG["yellow"] if progress < 0.68 else EDG["slate"])
+            self.canvas.create_rectangle(x0 - 5, y0 - 5, x1 + 5, y1 + 5, outline=EDG["red"], width=3)
+            rng = random.Random(int(event.created_at * 1000) + event.target_id * 31)
+            for i in range(18):
+                angle = rng.random() * math.tau
+                speed = 18 + rng.random() * 72
+                px = cx + math.cos(angle) * speed * progress
+                py = cy + math.sin(angle) * speed * progress + 18 * progress * progress
+                size = max(2, 9 * (1.0 - progress) + rng.random() * 4)
+                self.canvas.create_rectangle(px - size, py - size, px + size, py + size, fill=fade_color, outline="")
+            ring = 12 + progress * 68
+            self.canvas.create_oval(cx - ring, cy - ring, cx + ring, cy + ring, outline=fade_color, width=max(1, int(5 * (1.0 - progress))))
 
     def node_label(self, node_id):
         if node_id in self.solver.anchors:
@@ -1919,6 +2347,9 @@ def main():
     parser.add_argument("--phone-port", type=int, default=8080)
     parser.add_argument("--wifi-ssid")
     parser.add_argument("--wifi-password")
+    parser.add_argument("--local-audio", choices=("all", "fallback", "off"), default="all",
+                        help="Laptop audio behavior: all events, only phone fallback/prop, or off.")
+    parser.add_argument("--flip-map-y", action="store_true", help="Flip the arena map vertically in the dashboard.")
     args = parser.parse_args()
 
     RSSI_AT_1_METER = args.rssi_1m
@@ -1951,11 +2382,11 @@ def main():
     if args.fake:
         transport = FakeTransport(incoming, outgoing)
     else:
-        port_name = normalize_port_name(args.port) or choose_port()
-        if port_name is None:
-            print("No serial ports found. Plug in the bridge/player ESP32 and rerun.")
-            sys.exit(1)
-        transport = SerialTransport(port_name, args.baud, incoming, outgoing)
+        requested_port = normalize_port_name(args.port)
+        port_name = requested_port or "auto"
+        if requested_port is None and choose_port() is None:
+            print("No serial ports found yet. The server will keep waiting for the bridge ESP32.")
+        transport = SerialTransport(requested_port, args.baud, incoming, outgoing)
 
     threading.Thread(target=transport.run, daemon=True).start()
 
@@ -1967,13 +2398,17 @@ def main():
         simple_combat=args.simple_combat,
         audio_hub=audio_hub,
         local_audio=local_audio,
+        local_audio_mode=args.local_audio,
         prop_position_getter=lambda: nearest_origin_anchor(solver.anchors),
     )
     threading.Thread(
         target=CommandConsole(outgoing, game, audio_hub, phone_url, args.wifi_ssid, args.wifi_password).run,
         daemon=True,
     ).start()
-    MapApp(root, solver, game, incoming, outgoing, port_name, phone_url, audio_hub, args.wifi_ssid, args.wifi_password)
+    MapApp(
+        root, solver, game, incoming, outgoing, port_name, phone_url, audio_hub,
+        args.wifi_ssid, args.wifi_password, flip_map_y=args.flip_map_y
+    )
     root.mainloop()
 
 

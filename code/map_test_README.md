@@ -219,3 +219,38 @@ at all times. Bad non-line-of-sight nodes can still hurt, but the server
 downweights far/noisy links instead of letting them drag the whole solve around.
 
 If `COM4` says access denied, close Arduino Serial Monitor/Plotter and any other running Python server. Only one process can own a COM port.
+
+If the bridge ESP32 reboots or disappears briefly, the server now keeps running and reconnects to the COM port. Stale `WORLD` and `STATE` lines are coalesced while disconnected, while commands such as `PROP`, `RECENTER`, and `TUNE` stay queued. The bridge prints `BRIDGE_BOOT,reset_reason=...` at startup; if that appears during play, the bridge really did reset. Re-upload the bridge sketch after relay wiring changes.
+
+Relay reset survival notes: power the relay coil side separately when possible, share ground with the ESP32, keep relay/load wiring physically away from the ESP32 antenna/USB cable, and add flyback/snubber protection if the relay board does not already include it.
+
+## Phone Audio / Laptop Fallback
+
+Phones choose `Sol` or `Luna` on the audio page. `Sol` is controller `101`; `Luna` is controller `102`. The server sends player-specific sounds only to the matching phone. If nobody is currently connected for that player, the same event falls back to the laptop speaker immediately. `Fan Face` prop sounds always come from the laptop.
+
+By default the laptop is now prepared to play all game audio too. Use `--local-audio fallback` if you only want the laptop when phones disconnect, or `--local-audio off` if phones are definitely working. Laptop hit/block sounds are delayed slightly so a fireball cast can overlap into the impact.
+
+Use `--flip-map-y` if the spectator map is vertically opposite from the physical arena.
+
+Browsers usually pause network/audio work when the phone screen turns off. The phone page requests a screen wake lock when audio is armed, but the safest hackathon move is still to keep the phones plugged in and awake.
+
+Drop replacement sounds into `code/server/static/audio/`. The server scans names at startup and on `/manifest.json`; use these prefixes:
+
+- `fireball_core...`
+- `fireball_voice...`, `fireball_scream...`, or `fireball_yell...`
+- `shield_core...`
+- `shield_voice...`
+- `hit...`, `hit_bitcrush...`, `hurt...`, or `damage...`
+- `block...`, `deflect...`, or `parry...`
+- `prop...`, `prop_hit...`, `fan_face...`, or `fanface...`
+- `denied...`, `fail...`, or `no_mana...`
+
+Supported phone formats are `.wav`, `.mp3`, `.ogg`, and `.m4a`. Laptop fallback uses Windows `winsound`, so `.wav` files are best if you want fallback audio. The phone page cache now versions itself from the audio file timestamps/sizes, so replacing a sound with the same filename should load the new file after refreshing the page.
+
+Console helpers:
+
+```text
+audio rescan
+clients
+hotspot
+```

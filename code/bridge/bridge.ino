@@ -26,6 +26,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <esp_system.h>
 
 #if __has_include(<esp_arduino_version.h>)
 #include <esp_arduino_version.h>
@@ -50,6 +51,7 @@ const uint8_t PACKET_TYPE_RECENTER = 8;
 const uint8_t PACKET_TYPE_TUNE = 9;
 
 const uint32_t ANCHOR_REANNOUNCE_MS = 2000;
+const uint8_t EXTRA_PROP_LIGHT_FLASHES = 3;
 
 uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -622,10 +624,14 @@ void setupEspNow() {
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
   setupRelays();
+  delay(250);
 
   Serial.println();
+  Serial.print("BRIDGE_BOOT,reset_reason=");
+  Serial.print((int)esp_reset_reason());
+  Serial.print(",uptime=");
+  Serial.println(millis());
   Serial.println("ESP-NOW Spell Arena laptop bridge");
   Serial.print("BRIDGE_ID=");
   Serial.println(BRIDGE_ID);

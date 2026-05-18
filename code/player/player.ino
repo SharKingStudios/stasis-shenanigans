@@ -103,12 +103,14 @@ const int IMU_ACCEL_X_SIGN = -1;  // Current spellbook mount is rotated 180 degr
 const int IMU_ACCEL_Y_SIGN = -1;
 const int IMU_ACCEL_Z_SIGN = 1;
 const int IMU_GYRO_Z_SIGN = -1;
-const float GYRO_YAW_DEADBAND_DPS = 4.5f;
+const float GYRO_YAW_DEADBAND_DPS = 5.8f;
 const float GYRO_STILL_DPS = 8.0f;
 const float GYRO_BIAS_LEARN_ALPHA = 0.010f;
 const float STILL_ACCEL_DELTA_G = 0.085f;
-const float YAW_STILL_LINEAR_ACCEL_G = 0.08f;
-const float YAW_STILL_GYRO_DPS = 18.0f;
+const float YAW_STILL_LINEAR_ACCEL_G = 0.10f;
+const float YAW_STILL_GYRO_DPS = 32.0f;
+const float YAW_STILL_BIAS_LEARN_ALPHA = 0.035f;
+const uint8_t YAW_STILL_CONFIRM_SAMPLES = 8;
 float GESTURE_START_LINEAR_ACCEL_G = 0.30f;
 const float GESTURE_END_LINEAR_ACCEL_G = 0.12f;
 const uint32_t GESTURE_MIN_MS = 130;
@@ -286,6 +288,7 @@ float tiltFromBootDeg = 0.0f;
 bool yawFrozen = false;
 bool shieldFaceUpReady = false;
 float lastAccelMag = 1.0f;
+uint8_t yawStillSamples = 0;
 float shieldAngleAccum = 0.0f;
 float shieldRadiusEstimateM = 0.0f;
 uint16_t shieldActiveSamples = 0;
@@ -520,6 +523,7 @@ bool sampleStillGyroBias(const char *source) {
   gyroXDps = 0.0f;
   gyroYDps = 0.0f;
   gyroZDps = 0.0f;
+  yawStillSamples = YAW_STILL_CONFIRM_SAMPLES;
   lastImuUs = micros();
 
   Serial.print("RECENTER_GYRO,");
@@ -897,12 +901,22 @@ void updateImu() {
     gyroZDps = 0.0f;
   }
 
-  bool yawStill = linearAccelMag < YAW_STILL_LINEAR_ACCEL_G &&
-                  fabsf(accelMag - 1.0f) < STILL_ACCEL_DELTA_G &&
-                  fabsf(accelMag - lastAccelMag) < STILL_ACCEL_DELTA_G &&
-                  fabsf(gyroZDps) < YAW_STILL_GYRO_DPS;
-  if (yawStill) {
-    gyroZBias = gyroZBias * (1.0f - GYRO_BIAS_LEARN_ALPHA) + (float)gzRaw * GYRO_BIAS_LEARN_ALPHA;
+  bool yawStillCandidate = linearAccelMag < YAW_STILL_LINEAR_ACCEL_G &&
+                           fabsf(accelMag - 1.0f) < STILL_ACCEL_DELTA_G &&
+                           fabsf(accelMag - lastAccelMag) < STILL_ACCEL_DELTA_G &&
+                           fabsf(gyroXDps) < YAW_STILL_GYRO_DPS &&
+                           fabsf(gyroYDps) < YAW_STILL_GYRO_DPS &&
+                           fabsf(gyroZDps) < YAW_STILL_GYRO_DPS;
+  if (yawStillCandidate) {
+    if (yawStillSamples < 255) {
+      yawStillSamples++;
+    }
+  } else {
+    yawStillSamples = 0;
+  }
+
+  if (yawStillSamples >= YAW_STILL_CONFIRM_SAMPLES) {
+    gyroZBias = gyroZBias * (1.0f - YAW_STILL_BIAS_LEARN_ALPHA) + (float)gzRaw * YAW_STILL_BIAS_LEARN_ALPHA;
     gyroZDps = 0.0f;
   }
 
