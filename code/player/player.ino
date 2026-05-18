@@ -8,6 +8,7 @@
     - 5 green health LEDs on GPIO 32, 33, 25, 26, 27
     - 4 red effect LEDs on GPIO 16, 17, 18, 19
     - Onboard status LED on GPIO 2
+    - Active-low yaw recenter button on GPIO 23 to GND
 
   The player listens for field beacons and other player hellos, sends RSSI
   observations, tracks yaw from the MPU6050 gyro, detects gestures locally,
@@ -48,6 +49,7 @@
 const uint8_t HEALTH_LED_PINS[5] = {32, 33, 25, 26, 27};
 const uint8_t EFFECT_LED_PINS[4] = {16, 17, 18, 19};
 const uint8_t ONBOARD_LED_PIN = 2;
+const uint8_t RECENTER_BUTTON_PIN = 23;
 
 // ---------- Shared radio settings ----------
 #define WIFI_CHANNEL 6
@@ -89,6 +91,10 @@ const uint32_t FIREBALL_COOLDOWN_MS = 650;
 const uint32_t SHIELD_COOLDOWN_MS = 1100;
 uint32_t CAST_LOCKOUT_MS = 1800;
 const uint32_t IMU_DEBUG_INTERVAL_MS = 1000;
+const uint32_t RECENTER_BUTTON_DEBOUNCE_MS = 45;
+const uint32_t RECENTER_BUTTON_REPEAT_MS = 800;
+const uint16_t RECENTER_GYRO_SAMPLES = 70;
+const uint8_t RECENTER_GYRO_SAMPLE_DELAY_MS = 3;
 const uint8_t OLED_ROTATION = 2;  // 0 normal, 2 upside down.
 
 // MPU6050 yaw is gyro integration only, so these values intentionally favor
@@ -114,7 +120,7 @@ float FIREBALL_DOWN_ACCEL_G = 0.56f;
 float FIREBALL_DOWN_BRAKE_G = -0.28f;
 float FIREBALL_MIN_PEAK_LINEAR_G = 0.74f;
 float SHIELD_UP_ACCEL_G = 0.30f;
-float SHIELD_UP_BRAKE_G = 0.10f;
+float SHIELD_UP_BRAKE_G = 0.08f;
 float SHIELD_MIN_PEAK_LINEAR_G = 0.40f;
 float SHIELD_MIN_PITCH_DEG = 0.0f;
 float SHIELD_MIN_PITCH_DELTA_DEG = 0.0f;
@@ -318,9 +324,19 @@ uint16_t lastEventSequence = 0;
 uint8_t lastEventType = EVENT_NONE;
 uint32_t eventFlashUntilMs = 0;
 uint32_t onboardBlinkUntilMs = 0;
+uint32_t recenterFlashUntilMs = 0;
+bool recenterButtonLastRaw = HIGH;
+bool recenterButtonPressed = false;
+uint32_t recenterButtonChangedMs = 0;
+uint32_t lastLocalRecenterMs = 0;
+volatile bool radioRecenterRequested = false;
 bool hasWorldPosition = false;
 float worldX = 0.0f;
 float worldY = 0.0f;
+
+bool readMpuRaw(int16_t &ax, int16_t &ay, int16_t &az,
+                int16_t &gx, int16_t &gy, int16_t &gz);
+void resetGestureClassifier(uint32_t now);
 
 float normalizeDeg(float deg) {
   while (deg >= 180.0f) deg -= 360.0f;
@@ -454,6 +470,112 @@ void triggerOnboardBlink(uint16_t durationMs) {
   onboardBlinkUntilMs = millis() + durationMs;
 }
 
+void showRecenterOled(const char *status) {
+#if HAS_OLED
+  display.clearDisplay();
+  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("RECENTER");
+  display.setCursor(0, 18);
+  display.println("Hold still");
+  display.setCursor(0, 38);
+  display.println(status);
+  display.display();
+#endif
+}
+
+bool sampleStillGyroBias(const char *source) {
+  int32_t gxBiasSum = 0;
+  int32_t gyBiasSum = 0;
+  int32_t gzBiasSum = 0;
+  int16_t minGz = 32767;
+  int16_t maxGz = -32768;
+  int samples = 0;
+
+  for (uint16_t i = 0; i < RECENTER_GYRO_SAMPLES; i++) {
+    int16_t ax, ay, az, gx, gy, gz;
+    if (readMpuRaw(ax, ay, az, gx, gy, gz)) {
+      gxBiasSum += gx;
+      gyBiasSum += gy;
+      gzBiasSum += gz;
+      minGz = min(minGz, gz);
+      maxGz = max(maxGz, gz);
+      samples++;
+    }
+    delay(RECENTER_GYRO_SAMPLE_DELAY_MS);
+  }
+
+  if (samples < 20) {
+    Serial.print("RECENTER_FAIL,");
+    Serial.print(source);
+    Serial.print(",samples=");
+    Serial.println(samples);
+    return false;
+  }
+
+  gyroXBias = (float)gxBiasSum / (float)samples;
+  gyroYBias = (float)gyBiasSum / (float)samples;
+  gyroZBias = (float)gzBiasSum / (float)samples;
+  gyroXDps = 0.0f;
+  gyroYDps = 0.0f;
+  gyroZDps = 0.0f;
+  lastImuUs = micros();
+
+  Serial.print("RECENTER_GYRO,");
+  Serial.print(source);
+  Serial.print(",samples=");
+  Serial.print(samples);
+  Serial.print(",gzBias=");
+  Serial.print(gyroZBias, 2);
+  Serial.print(",gzRange=");
+  Serial.println(maxGz - minGz);
+  return true;
+}
+
+void resetYawToNorth(const char *source) {
+  showRecenterOled("Sampling gyro...");
+  sampleStillGyroBias(source);
+  yawDeg = 0.0f;
+  resetGestureClassifier(millis());
+  recenterFlashUntilMs = millis() + 800;
+  triggerOnboardBlink(250);
+  Serial.print("LOCAL_RECENTER,");
+  Serial.print(source);
+  Serial.print(",");
+  Serial.println(millis());
+}
+
+void updateRecenterButton() {
+  uint32_t now = millis();
+  bool raw = digitalRead(RECENTER_BUTTON_PIN);
+
+  if (raw != recenterButtonLastRaw) {
+    recenterButtonLastRaw = raw;
+    recenterButtonChangedMs = now;
+  }
+
+  if (now - recenterButtonChangedMs < RECENTER_BUTTON_DEBOUNCE_MS) {
+    return;
+  }
+
+  bool pressed = raw == LOW;
+  if (pressed && !recenterButtonPressed &&
+      (lastLocalRecenterMs == 0 || now - lastLocalRecenterMs >= RECENTER_BUTTON_REPEAT_MS)) {
+    lastLocalRecenterMs = now;
+    resetYawToNorth("BUTTON");
+  }
+  recenterButtonPressed = pressed;
+}
+
+void updateRadioRecenterRequest() {
+  if (!radioRecenterRequested) {
+    return;
+  }
+  radioRecenterRequested = false;
+  resetYawToNorth("RADIO");
+}
+
 void updateOnboardLed() {
   uint32_t now = millis();
   if (now >= onboardBlinkUntilMs) {
@@ -500,6 +622,11 @@ void ledSelfTest() {
 void updateEffectLeds() {
   uint32_t now = millis();
   updateOnboardLed();
+
+  if (now < recenterFlashUntilMs) {
+    setEffectLeds(((now / 85) % 2) == 0 ? 0x0F : 0x00);
+    return;
+  }
 
   if (currentFlags & FLAG_SHIELD) {
     uint8_t phase = (now / 120) % 4;
@@ -888,20 +1015,22 @@ void finalizeGestureClassifier(uint32_t now) {
 
   float fireballDominance = gestureVerticalEnergy / max(0.001f, gestureSideEnergy);
   float shieldDominance = gestureVerticalEnergy / max(0.001f, gestureSideEnergy);
-  float shieldRequiredDominance = min(SPELL_AXIS_DOMINANCE, 0.70f);
+  float shieldRequiredDominance = min(SPELL_AXIS_DOMINANCE, 0.75f);
   bool downFlick = gestureSawFireballDown && gestureSawBrakeAfterFireballDown;
   bool upFlick = gestureSawShieldUp && gestureSawBrakeAfterShieldUp;
+  bool fireballFirst = gestureFirstDirection == 1 || gestureFireballPeakMs <= gestureShieldPeakMs;
+  bool shieldFirst = gestureFirstDirection == 2 || gestureShieldPeakMs < gestureFireballPeakMs;
+  bool fireballCandidate = enoughTime &&
+                           fireballFirst &&
+                           downFlick &&
+                           gesturePeakLinear >= FIREBALL_MIN_PEAK_LINEAR_G &&
+                           fireballDominance >= SPELL_AXIS_DOMINANCE;
   bool shieldCandidate = enoughTime &&
-                         gestureFirstDirection == 2 &&
+                         !fireballCandidate &&
+                         shieldFirst &&
                          upFlick &&
                          gesturePeakLinear >= SHIELD_MIN_PEAK_LINEAR_G &&
                          shieldDominance >= shieldRequiredDominance;
-  bool fireballCandidate = enoughTime &&
-                           gestureFirstDirection == 1 &&
-                           downFlick &&
-                           gesturePeakLinear >= FIREBALL_MIN_PEAK_LINEAR_G &&
-                           fireballDominance >= SPELL_AXIS_DOMINANCE &&
-                           !shieldCandidate;
 
   if (shieldCandidate && cooldownShield && sharedCastReady) {
     lastShieldMs = now;
@@ -947,6 +1076,11 @@ void updateGestureClassifier(uint32_t now) {
     float fireballStrength = fireballAccel / max(0.001f, FIREBALL_DOWN_ACCEL_G);
     float shieldStrength = shieldAccel / max(0.001f, SHIELD_UP_ACCEL_G);
     gestureFirstDirection = shieldStrength > fireballStrength ? 2 : 1;
+  }
+  if (gestureFirstDirection == 2 && fireballStarted &&
+      fireballAccel >= FIREBALL_DOWN_ACCEL_G * 1.05f &&
+      fireballAccel > shieldAccel * 0.80f) {
+    gestureFirstDirection = 1;
   }
 
   if (fireballStarted) {
@@ -1076,7 +1210,9 @@ void printImuDebug() {
   Serial.print(",");
   Serial.print(gestureStartPitchDeg, 0);
   Serial.print(",");
-  Serial.println(gesturePeakPitchDeg, 0);
+  Serial.print(gesturePeakPitchDeg, 0);
+  Serial.print(",");
+  Serial.println(digitalRead(RECENTER_BUTTON_PIN) == LOW ? 1 : 0);
 }
 
 void handleFieldBeacon(const uint8_t *data, int len, int rssiDbm) {
@@ -1160,7 +1296,7 @@ void applyGameState(const GameStatePacket &packet) {
 
 void applyRecenter(const RecenterPacket &packet) {
   if (packet.targetId == PLAYER_ID || packet.targetId == 255) {
-    yawDeg = 0.0f;
+    radioRecenterRequested = true;
   }
 }
 
@@ -1188,7 +1324,7 @@ void applyTuneValues(uint8_t targetId,
   SHIELD_UP_BRAKE_G = constrain(shieldBrake, -3.00f, 0.50f);
   SHIELD_MIN_PEAK_LINEAR_G = constrain(shieldPeak, 0.05f, 4.00f);
   SHIELD_MIN_PITCH_DEG = constrain(shieldPitch, 5.0f, 89.0f);
-  SHIELD_MIN_PITCH_DELTA_DEG = constrain(shieldPitchDelta, 1.0f, 89.0f);
+  SHIELD_MIN_PITCH_DELTA_DEG = constrain(shieldPitchDelta, 0.0f, 89.0f);
   SPELL_AXIS_DOMINANCE = constrain(axisDominance, 0.2f, 8.0f);
   CAST_LOCKOUT_MS = constrain((int)castLockoutMs, 200, 5000);
 
@@ -1240,7 +1376,7 @@ void handleServerLine(String line) {
     int comma = line.indexOf(',');
     int target = comma >= 0 ? line.substring(comma + 1).toInt() : PLAYER_ID;
     if (target == PLAYER_ID || target == 255) {
-      yawDeg = 0.0f;
+      resetYawToNorth("SERIAL");
     }
   } else if (line.startsWith("STATE")) {
     int values[6] = {PLAYER_ID, currentHp, currentMana, currentFlags, 0, EVENT_NONE};
@@ -1422,6 +1558,11 @@ void sendHello() {
 void setupDisplayAndLeds() {
   pinMode(ONBOARD_LED_PIN, OUTPUT);
   digitalWrite(ONBOARD_LED_PIN, LOW);
+  pinMode(RECENTER_BUTTON_PIN, INPUT_PULLUP);
+  Serial.print("RECENTER_BUTTON GPIO");
+  Serial.print(RECENTER_BUTTON_PIN);
+  Serial.print("=");
+  Serial.println(digitalRead(RECENTER_BUTTON_PIN) == LOW ? "PRESSED" : "OPEN");
   for (int i = 0; i < 5; i++) {
     pinMode(HEALTH_LED_PINS[i], OUTPUT);
   }
@@ -1475,6 +1616,8 @@ void loop() {
 
   readSerialCommands();
   updateImu();
+  updateRecenterButton();
+  updateRadioRecenterRequest();
   if (mpuReady) {
     detectGestures();
   }

@@ -36,7 +36,7 @@
 
 const uint8_t LIGHT_RELAY_PIN = 25;
 const uint8_t FAN_RELAY_PIN = 26;
-const bool RELAY_ACTIVE_LOW = true;
+const bool RELAY_ACTIVE_LOW = false;
 
 const uint16_t PACKET_MAGIC = 0x51A7;
 const uint8_t PACKET_TYPE_FIELD_BEACON = 1;

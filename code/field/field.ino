@@ -17,9 +17,9 @@
 #include <esp_wifi.h>
 
 // ---------- Change these per field board ----------
-#define FIELD_ID 1
-const float FIELD_X_METERS = 0.0f;
-const float FIELD_Y_METERS = 0.0f;
+#define FIELD_ID 4
+const float FIELD_X_METERS = -2.0f;
+const float FIELD_Y_METERS = 3.0f;
 
 // ---------- Shared radio settings ----------
 #define WIFI_CHANNEL 6

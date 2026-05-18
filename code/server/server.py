@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import json
 import math
 import os
@@ -28,6 +29,8 @@ except ImportError:
 BAUD_RATE = 115200
 BASE_DIR = Path(__file__).resolve().parent
 AUDIO_DIR = BASE_DIR / "static" / "audio"
+FONT_DIR = BASE_DIR / "static" / "fonts"
+QR_DIR = BASE_DIR / "static" / "qr"
 
 # Localization tuning.
 OBS_TTL_SECONDS = 5.5
@@ -61,9 +64,9 @@ WORLD_SEND_INTERVAL = 0.10
 STATE_SEND_INTERVAL = 0.25
 
 TUNE_PRESETS = {
-    "easy": (255, 0.22, 0.45, -0.20, 0.58, 0.24, 0.14, 0.32, 0.0, 0.0, 1.10, 1500),
-    "normal": (255, 0.30, 0.56, -0.28, 0.74, 0.30, 0.10, 0.40, 0.0, 0.0, 1.10, 1800),
-    "hard": (255, 0.38, 0.70, -0.38, 0.95, 0.42, 0.02, 0.58, 0.0, 0.0, 1.35, 2200),
+    "easy": (255, 0.22, 0.45, -0.20, 0.58, 0.22, 0.16, 0.30, 0.0, 0.0, 1.10, 1500),
+    "normal": (255, 0.30, 0.56, -0.28, 0.74, 0.30, 0.08, 0.40, 0.0, 0.0, 1.10, 1800),
+    "hard": (255, 0.38, 0.70, -0.38, 0.95, 0.44, -0.08, 0.58, 0.0, 0.0, 1.35, 2200),
 }
 
 SPELL_FIREBALL = 1
@@ -92,6 +95,7 @@ PROP_FAN_MS = 2500
 PROP_FLASH_COUNT = 4
 PROP_FLASH_ON_MS = 120
 PROP_FLASH_OFF_MS = 120
+PROP_LOCAL_AUDIO_DELAY_SECONDS = 0.18
 
 AUDIO_MANIFEST = {
     "fireball_core": ["fireball_core_01.wav"],
@@ -109,15 +113,47 @@ AUDIO_MANIFEST = {
     ],
     "hit": ["hit_bitcrush_01.wav"],
     "block": ["block_01.wav"],
-    "prop": ["prop_hit_01.wav"],
+    "prop": [
+        "prop_hit_01.wav",
+        "prop_hit_02.wav",
+        "prop_hit_03.wav",
+        "prop_hit_04.wav",
+        "prop_hit_05.wav",
+    ],
     "denied": ["denied_01.wav"],
+}
+
+EDG = {
+    "ember": "#be4a2f",
+    "rust": "#d77643",
+    "parchment": "#ead4aa",
+    "leather": "#733e39",
+    "maroon": "#a22633",
+    "red": "#e43b44",
+    "orange": "#f77622",
+    "gold": "#feae34",
+    "yellow": "#fee761",
+    "green": "#63c74d",
+    "deep_green": "#265c42",
+    "teal_black": "#193c3e",
+    "blue": "#0099db",
+    "cyan": "#2ce8f5",
+    "white": "#ffffff",
+    "silver": "#c0cbdc",
+    "steel": "#8b9bb4",
+    "slate": "#5a6988",
+    "indigo": "#3a4466",
+    "navy": "#262b44",
+    "void": "#181425",
+    "pink": "#ff0044",
+    "purple": "#68386c",
 }
 
 # Must match the field positions uploaded in code/field/field.ino.
 DEFAULT_ANCHORS = {
-    1: (0.0, 0.0),
-    2: (2.0, 0.0),
-    3: (0.0, 2.0),
+    # 1: (0.0, 0.0),
+    # 2: (2.0, 0.0),
+    # 3: (0.0, 2.0),
 }
 
 
@@ -173,7 +209,6 @@ class PlayerState:
     last_state_sent_at: float = 0.0
     last_event_seq: int = 0
     last_event_type: int = EVENT_NONE
-    score_hits: int = 0
     last_action: str = "ready"
     dirty: bool = True
 
@@ -232,6 +267,36 @@ def qr_matrix(text):
     return qr.get_matrix()
 
 
+def ensure_site_qr(phone_url):
+    QR_DIR.mkdir(parents=True, exist_ok=True)
+    path = QR_DIR / "site_qr.png"
+    try:
+        import qrcode
+        qr = qrcode.QRCode(box_size=18, border=4)
+        qr.add_data(phone_url)
+        qr.make(fit=True)
+        img = qr.make_image(fill_color="black", back_color="white")
+        img.save(path)
+    except Exception:
+        return None
+    return path
+
+
+def load_dashboard_fonts():
+    if os.name != "nt":
+        return
+    font_paths = [
+        FONT_DIR / "PressStart2P-Regular.ttf",
+        FONT_DIR / "PixelifySans-wght.ttf",
+    ]
+    for path in font_paths:
+        if path.exists():
+            try:
+                ctypes.windll.gdi32.AddFontResourceExW(str(path), 0x10, 0)
+            except Exception:
+                pass
+
+
 def audio_pitch(lo, hi):
     return round(random.uniform(lo, hi), 3)
 
@@ -277,15 +342,20 @@ PHONE_PAGE_HTML = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Spell Arena Audio</title>
   <style>
-    :root { color-scheme: dark; --bg:#101114; --panel:#191b20; --line:#2b3038; --text:#f1efe7; --muted:#a7a194; --hot:#ff6b35; --cool:#4dc3ff; }
+    @font-face { font-family: 'Pixelify Sans'; src: url('/fonts/pixelify-sans-latin-400-normal.woff2') format('woff2'); font-weight: 400; }
+    @font-face { font-family: 'Press Start 2P'; src: url('/fonts/press-start-2p-latin-400-normal.woff2') format('woff2'); font-weight: 400; }
+    :root { color-scheme: dark; --bg:#181425; --panel:#262b44; --line:#3a4466; --text:#ffffff; --muted:#c0cbdc; --hot:#f77622; --cool:#2ce8f5; }
     * { box-sizing: border-box; }
-    body { margin: 0; min-height: 100vh; font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); display: grid; place-items: center; }
+    body { margin: 0; min-height: 100vh; font-family: 'Pixelify Sans', system-ui, sans-serif; background: var(--bg); color: var(--text); display: grid; place-items: center; }
     main { width: min(92vw, 430px); border: 1px solid var(--line); background: var(--panel); padding: 24px; }
-    h1 { margin: 0 0 8px; font-size: 28px; letter-spacing: 0; }
+    h1 { margin: 0 0 8px; font-family: 'Press Start 2P', monospace; font-size: 20px; letter-spacing: 0; }
     p { color: var(--muted); margin: 8px 0; line-height: 1.35; }
     button { width: 100%; margin-top: 18px; padding: 16px; border: 0; background: var(--hot); color: #190904; font-weight: 800; font-size: 18px; }
     .bar { height: 12px; border: 1px solid var(--line); margin: 18px 0 8px; overflow: hidden; }
     .fill { height: 100%; width: 0%; background: var(--cool); transition: width .18s ease; }
+    .choice { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+    .choice button { margin: 0; padding: 12px; background: #3a4466; color: var(--text); }
+    .choice button.selected { background: var(--cool); color: #181425; }
     .status { display: grid; grid-template-columns: 1fr auto; gap: 8px; border-top: 1px solid var(--line); padding-top: 14px; margin-top: 18px; font-size: 14px; }
     .pulse { width: 12px; height: 12px; background: #555; align-self: center; }
     .pulse.on { background: var(--cool); box-shadow: 0 0 18px var(--cool); }
@@ -297,11 +367,17 @@ PHONE_PAGE_HTML = r"""<!doctype html>
     <h1>Spell Arena</h1>
     <p id="lead">Loading spell audio...</p>
     <div class="bar"><div id="fill" class="fill"></div></div>
+    <div class="choice">
+      <button id="choose101" type="button">Player 1</button>
+      <button id="choose102" type="button">Player A</button>
+    </div>
     <button id="arm">Tap to arm audio</button>
     <div class="status">
       <span>Audio</span><span id="audio">loading</span>
       <span>Server</span><span id="server">connecting</span>
       <span>Events</span><span id="events">0</span>
+      <span>Player</span><span id="playerChoice">none</span>
+      <span>Wake</span><span id="wake">not armed</span>
       <span>Ready</span><span id="readyLight" class="pulse"></span>
     </div>
     <div id="last" class="last">Waiting for spells.</div>
@@ -313,9 +389,30 @@ PHONE_PAGE_HTML = r"""<!doctype html>
     const audioState = document.getElementById('audio');
     const serverState = document.getElementById('server');
     const eventState = document.getElementById('events');
+    const playerChoiceState = document.getElementById('playerChoice');
+    const wakeState = document.getElementById('wake');
     const readyLight = document.getElementById('readyLight');
     const last = document.getElementById('last');
-    let ctx, manifest, buffers = {}, eventCount = 0, armed = false;
+    const choose101 = document.getElementById('choose101');
+    const choose102 = document.getElementById('choose102');
+    let ctx, manifest, buffers = {}, eventCount = 0, armed = false, wakeLock = null;
+    let selectedPlayer = Number(localStorage.getItem('spellArenaPlayer') || 0);
+
+    function updatePlayerChoice() {
+      choose101.classList.toggle('selected', selectedPlayer === 101);
+      choose102.classList.toggle('selected', selectedPlayer === 102);
+      playerChoiceState.textContent = selectedPlayer === 101 ? 'Player 1' : (selectedPlayer === 102 ? 'Player A' : 'choose');
+    }
+
+    function choosePlayer(id) {
+      selectedPlayer = id;
+      localStorage.setItem('spellArenaPlayer', String(id));
+      updatePlayerChoice();
+    }
+
+    choose101.addEventListener('click', () => choosePlayer(101));
+    choose102.addEventListener('click', () => choosePlayer(102));
+    updatePlayerChoice();
 
     async function loadAudio() {
       manifest = await fetch('/manifest.json').then(r => r.json());
@@ -333,6 +430,22 @@ PHONE_PAGE_HTML = r"""<!doctype html>
       }
       lead.textContent = 'Audio cached. Tap once before the duel starts.';
       audioState.textContent = 'cached';
+    }
+
+    async function requestWakeLock() {
+      if (!('wakeLock' in navigator)) {
+        wakeState.textContent = 'unsupported';
+        return;
+      }
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeState.textContent = 'on';
+        wakeLock.addEventListener('release', () => {
+          wakeState.textContent = document.visibilityState === 'visible' ? 'released' : 'hidden';
+        });
+      } catch (err) {
+        wakeState.textContent = 'blocked';
+      }
     }
 
     function playFile(file, rate, gainValue = 0.9, delay = 0) {
@@ -354,6 +467,11 @@ PHONE_PAGE_HTML = r"""<!doctype html>
     }
 
     function handleAudio(event) {
+      const audience = event.type === 'fireball_cast' || event.type === 'shield_cast' || event.type === 'denied'
+        ? event.casterId
+        : (event.type === 'hit' || event.type === 'block' ? event.targetId : 0);
+      if (event.type === 'prop_hit') return;
+      if (!selectedPlayer || audience !== selectedPlayer) return;
       eventCount++;
       eventState.textContent = String(eventCount);
       last.textContent = `${event.casterLabel || 'Arena'} ${event.type.replace('_', ' ')} ${event.targetLabel || ''}`.trim();
@@ -377,11 +495,16 @@ PHONE_PAGE_HTML = r"""<!doctype html>
 
     arm.addEventListener('click', async () => {
       await ctx.resume();
+      await requestWakeLock();
       armed = true;
       audioState.textContent = 'armed';
       readyLight.classList.add('on');
       arm.textContent = 'Audio armed';
       arm.disabled = true;
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (armed && document.visibilityState === 'visible') requestWakeLock();
     });
 
     function connectEvents() {
@@ -409,9 +532,10 @@ def ensure_audio_assets():
         "shield_core_01.wav": lambda p: write_sfx(p, "shield_core", 0.65),
         "hit_bitcrush_01.wav": lambda p: write_sfx(p, "hit", 0.42),
         "block_01.wav": lambda p: write_sfx(p, "block", 0.48),
-        "prop_hit_01.wav": lambda p: write_sfx(p, "prop", 0.95),
         "denied_01.wav": lambda p: write_sfx(p, "denied", 0.26),
     }
+    for i, name in enumerate(AUDIO_MANIFEST["prop"], start=1):
+        generators[name] = lambda p, idx=i: write_sfx(p, "prop", 0.95, idx)
     for i, name in enumerate(AUDIO_MANIFEST["fireball_voice"], start=1):
         generators[name] = lambda p, idx=i: write_sfx(p, "fireball_voice", 0.55, idx)
     for i, name in enumerate(AUDIO_MANIFEST["shield_voice"], start=1):
@@ -484,6 +608,8 @@ def make_phone_handler(audio_hub):
                 self.serve_events()
             elif path.startswith("/audio/"):
                 self.serve_audio(path[len("/audio/"):])
+            elif path.startswith("/fonts/"):
+                self.serve_font(path[len("/fonts/"):])
             else:
                 self.send_error(404)
 
@@ -502,6 +628,15 @@ def make_phone_handler(audio_hub):
                 self.send_error(404)
                 return
             self.send_bytes(path.read_bytes(), "audio/wav")
+
+        def serve_font(self, filename):
+            filename = os.path.basename(unquote(filename))
+            path = FONT_DIR / filename
+            if not path.exists():
+                self.send_error(404)
+                return
+            content_type = "font/woff2" if path.suffix.lower() == ".woff2" else "font/ttf"
+            self.send_bytes(path.read_bytes(), content_type)
 
         def serve_events(self):
             client = audio_hub.subscribe()
@@ -540,6 +675,36 @@ class PhoneAudioServer:
         handler = make_phone_handler(self.audio_hub)
         self.httpd = ThreadingHTTPServer((self.host, self.port), handler)
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+
+
+class LocalAudioPlayer:
+    def __init__(self):
+        self.enabled = os.name == "nt"
+        self._winsound = None
+        if self.enabled:
+            try:
+                import winsound
+                self._winsound = winsound
+            except ImportError:
+                self.enabled = False
+
+    def play_prop(self, delay_seconds=PROP_LOCAL_AUDIO_DELAY_SECONDS):
+        if not self.enabled or self._winsound is None:
+            return
+        if delay_seconds > 0:
+            threading.Timer(delay_seconds, self.play_prop, kwargs={"delay_seconds": 0}).start()
+            return
+        files = [AUDIO_DIR / name for name in AUDIO_MANIFEST["prop"]]
+        files = [path for path in files if path.exists()]
+        if not files:
+            return
+        try:
+            self._winsound.PlaySound(
+                str(random.choice(files)),
+                self._winsound.SND_FILENAME | self._winsound.SND_ASYNC,
+            )
+        except RuntimeError:
+            pass
 
 
 class LinkFilter:
@@ -884,12 +1049,13 @@ class MeshSolver:
 
 
 class GameEngine:
-    def __init__(self, outgoing, simple_combat=False, audio_hub=None, prop_position_getter=None):
+    def __init__(self, outgoing, simple_combat=False, audio_hub=None, local_audio=None, prop_position_getter=None):
         self.players = {}
         self.events = deque(maxlen=24)
         self.outgoing = outgoing
         self.simple_combat = simple_combat
         self.audio_hub = audio_hub
+        self.local_audio = local_audio
         self.prop_position_getter = prop_position_getter or (lambda: (0.0, 0.0))
         self.last_world_sent_at = 0.0
         self.world_sequence = 0
@@ -1051,7 +1217,6 @@ class GameEngine:
             return
 
         target.hp = max(0, target.hp - FIREBALL_DAMAGE)
-        caster.score_hits += 1
         caster.dirty = True
         target.last_action = "hit"
         target.dirty = True
@@ -1077,7 +1242,6 @@ class GameEngine:
             return (0.0, 0.0)
 
     def hit_prop(self, caster, start, prop_pos):
-        caster.score_hits += 1
         caster.last_action = "prop hit"
         caster.dirty = True
         self.outgoing.put(
@@ -1093,6 +1257,8 @@ class GameEngine:
             end=prop_pos,
             prop_hit=True,
         )
+        if self.local_audio:
+            self.local_audio.play_prop()
         self.broadcast_audio("prop_hit", caster_id=caster.player_id, target_label=PROP_NAME)
         self.send_state(caster, EVENT_NONE)
 
@@ -1149,6 +1315,8 @@ class GameEngine:
         )
         self.prop_sequence = (self.prop_sequence + 1) & 0xFFFF
         self.add_event(f"{PROP_NAME} test", EVENT_PROP_HIT, end=self.prop_position(), prop_hit=True)
+        if self.local_audio:
+            self.local_audio.play_prop()
         self.broadcast_audio("prop_hit", target_label=PROP_NAME)
 
     def trigger_audio_test(self, event_type):
@@ -1161,6 +1329,8 @@ class GameEngine:
             "denied": "denied",
         }.get(event_type)
         if mapped:
+            if mapped == "prop_hit" and self.local_audio:
+                self.local_audio.play_prop()
             self.broadcast_audio(mapped, caster_id=101, target_id=102 if mapped in ("hit", "block") else 0,
                                  target_label=PROP_NAME if mapped == "prop_hit" else None)
 
@@ -1389,11 +1559,11 @@ class MapApp:
         self.wifi_ssid = wifi_ssid
         self.wifi_password = wifi_password
         self.last_status = "Waiting for radio data..."
-        self.phone_qr = qr_matrix(phone_url)
-        self.wifi_qr = qr_matrix(wifi_qr_payload(wifi_ssid, wifi_password))
+        self.title_font = "Press Start 2P"
+        self.body_font = "Pixelify Sans"
 
         self.root.title("Spell Arena Duel Dashboard")
-        self.canvas = tk.Canvas(root, width=1360, height=820, bg="#101114", highlightthickness=0)
+        self.canvas = tk.Canvas(root, width=1360, height=820, bg=EDG["void"], highlightthickness=0)
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.root.bind("r", lambda event: self.game.recenter_all())
         self.root.after(33, self.tick)
@@ -1441,34 +1611,18 @@ class MapApp:
         self.canvas.delete("all")
         width = self.canvas.winfo_width()
         height = self.canvas.winfo_height()
-        left_w = 276
-        right_w = 276
-        top_h = 52
-        bottom_h = 150
-        map_rect = (left_w + 16, top_h + 10, width - right_w - 16, height - bottom_h)
+        map_rect = (0, 0, width, height)
 
-        self.canvas.create_rectangle(0, 0, width, height, fill="#101114", outline="")
-        self.draw_header(width)
-        self.draw_player_panel(0, top_h, left_w, height - bottom_h - top_h, self.game.players.get(101), 101, "#ff6b35")
-        self.draw_player_panel(width - right_w, top_h, right_w, height - bottom_h - top_h, self.game.players.get(102), 102, "#4dc3ff")
+        self.canvas.create_rectangle(0, 0, width, height, fill=EDG["void"], outline="")
 
         screen, bounds = self.screen_mapper(map_rect)
         self.draw_map_panel(map_rect, screen, bounds)
-        self.draw_bottom_bar(0, height - bottom_h, width, bottom_h)
+        hud_w = min(390, max(320, int(width * 0.28)))
+        hud_h = 190
+        self.draw_player_hud(18, 18, hud_w, hud_h, self.game.players.get(101), 101, EDG["orange"], "left")
+        self.draw_player_hud(width - hud_w - 18, 18, hud_w, hud_h, self.game.players.get(102), 102, EDG["cyan"], "right")
 
-    def draw_header(self, width):
-        self.canvas.create_rectangle(0, 0, width, 52, fill="#16191f", outline="#2a3038")
-        self.canvas.create_text(18, 12, anchor="nw", text="SPELL ARENA", fill="#f2efe8", font=("Segoe UI", 18, "bold"))
-        self.canvas.create_text(
-            190, 18,
-            anchor="nw",
-            text=f"Port {self.port_name}   Audio clients {self.audio_hub.client_count()}   {self.last_status}",
-            fill="#a8b0ba",
-            font=("Segoe UI", 10),
-        )
-        self.canvas.create_text(width - 18, 18, anchor="ne", text="R = recenter yaw", fill="#808895", font=("Segoe UI", 10))
-
-    def screen_mapper(self, rect):
+    def screen_mapper(self, rect, top_reserved=220):
         x0, y0, x1, y1 = rect
         points = list(self.solver.anchors.values()) + [(p.x, p.y) for p in self.game.players.values()] + [self.game.prop_position()]
         if not points:
@@ -1483,7 +1637,7 @@ class MapApp:
         if abs(max_y - min_y) < 1.0:
             min_y -= 0.5
             max_y += 0.5
-        scale = min((x1 - x0 - 52) / (max_x - min_x), (y1 - y0 - 52) / (max_y - min_y))
+        scale = min((x1 - x0 - 52) / (max_x - min_x), (y1 - y0 - top_reserved - 52) / (max_y - min_y))
 
         def screen(point):
             x, y = point
@@ -1495,26 +1649,24 @@ class MapApp:
 
     def draw_map_panel(self, rect, screen, bounds):
         x0, y0, x1, y1 = rect
-        self.canvas.create_rectangle(x0, y0, x1, y1, fill="#12161b", outline="#2a3038", width=2)
-        self.draw_grid(screen, *bounds)
+        self.canvas.create_rectangle(x0, y0, x1, y1, fill=EDG["void"], outline=EDG["indigo"], width=2)
+        self.draw_grid(rect, screen, *bounds)
         link_rows = self.solver.link_rows()
         self.draw_links(screen, link_rows)
         self.draw_events(screen)
         self.draw_fields(screen)
         self.draw_prop_target(screen)
         self.draw_players(screen)
-        self.canvas.create_text(x0 + 14, y0 + 10, anchor="nw", text="Arena Map", fill="#d9dedf", font=("Segoe UI", 12, "bold"))
-        self.draw_radio_debug(x1 - 248, y0 + 12, link_rows)
+        # self.canvas.create_text(x0 + 22, y1 - 48, anchor="sw", text="SPELL ARENA", fill=EDG["yellow"], font=(self.title_font, 18))
 
-    def draw_grid(self, screen, min_x, max_x, min_y, max_y):
+    def draw_grid(self, rect, screen, min_x, max_x, min_y, max_y):
+        x0, y0, x1, y1 = rect
         for x in range(math.floor(min_x), math.ceil(max_x) + 1):
-            sx1, sy1 = screen((x, min_y))
-            sx2, sy2 = screen((x, max_y))
-            self.canvas.create_line(sx1, sy1, sx2, sy2, fill="#20262d")
+            sx, _ = screen((x, min_y))
+            self.canvas.create_line(sx, y0, sx, y1, fill=EDG["navy"])
         for y in range(math.floor(min_y), math.ceil(max_y) + 1):
-            sx1, sy1 = screen((min_x, y))
-            sx2, sy2 = screen((max_x, y))
-            self.canvas.create_line(sx1, sy1, sx2, sy2, fill="#20262d")
+            _, sy = screen((min_x, y))
+            self.canvas.create_line(x0, sy, x1, sy, fill=EDG["navy"])
 
     def draw_links(self, screen, link_rows):
         for obs in link_rows[:24]:
@@ -1524,7 +1676,7 @@ class MapApp:
                 continue
             ax, ay = screen(a)
             bx, by = screen(b)
-            color = "#33414b" if obs.confidence >= 0.45 else "#2a2523"
+            color = EDG["indigo"] if obs.confidence >= 0.45 else EDG["navy"]
             self.canvas.create_line(ax, ay, bx, by, fill=color, width=1)
 
     def draw_events(self, screen):
@@ -1536,46 +1688,46 @@ class MapApp:
             if event.start and event.end:
                 sx, sy = screen(event.start)
                 ex, ey = screen(event.end)
-                color = "#ff6b35" if not event.blocked else "#4dc3ff"
+                color = EDG["orange"] if not event.blocked else EDG["cyan"]
                 width = 2 + int(7 * frac)
                 self.canvas.create_line(sx, sy, ex, ey, fill=color, width=width, dash=() if not event.blocked else (8, 5))
             if event.prop_hit and event.end:
                 x, y = screen(event.end)
                 radius = 20 + int((1.0 - frac) * 54)
-                self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline="#ffcf5a", width=3)
+                self.canvas.create_oval(x - radius, y - radius, x + radius, y + radius, outline=EDG["yellow"], width=3)
 
     def draw_fields(self, screen):
         health = self.solver.field_health()
-        colors = {"ok": "#3e8fcb", "warn": "#d3a23a", "bad": "#d95545"}
+        colors = {"ok": EDG["blue"], "warn": EDG["gold"], "bad": EDG["red"]}
         for node_id, point in sorted(self.solver.anchors.items()):
             x, y = screen(point)
             status, quality = health.get(node_id, ("warn", 0.0))
-            self.canvas.create_rectangle(x - 10, y - 10, x + 10, y + 10, fill=colors[status], outline="#0b0e11")
-            self.canvas.create_text(x, y - 24, text=f"F{node_id}", fill="#d7e8f8", font=("Segoe UI", 10, "bold"))
-            self.canvas.create_text(x, y + 23, text=f"{quality:.0%}", fill="#8e9aa7", font=("Segoe UI", 8))
+            self.canvas.create_rectangle(x - 10, y - 10, x + 10, y + 10, fill=colors[status], outline=EDG["void"])
+            self.canvas.create_text(x, y - 24, text=f"F{node_id}", fill=EDG["silver"], font=(self.body_font, 11, "bold"))
+            self.canvas.create_text(x, y + 23, text=f"{quality:.0%}", fill=EDG["steel"], font=(self.body_font, 9))
 
     def draw_prop_target(self, screen):
         x, y = screen(self.game.prop_position())
         now = time.time()
         recent = any(event.prop_hit and event.expires_at > now for event in self.game.events)
         pulse = 8 if recent and int(now * 12) % 2 == 0 else 0
-        self.canvas.create_oval(x - 20 - pulse, y - 20 - pulse, x + 20 + pulse, y + 20 + pulse, fill="#2b1712", outline="#ffcf5a", width=3)
-        self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill="#ffcf5a", outline="")
-        self.canvas.create_text(x, y + 34, text=PROP_NAME, fill="#ffd98b", font=("Segoe UI", 10, "bold"))
+        self.canvas.create_oval(x - 20 - pulse, y - 20 - pulse, x + 20 + pulse, y + 20 + pulse, fill=EDG["leather"], outline=EDG["yellow"], width=3)
+        self.canvas.create_oval(x - 7, y - 7, x + 7, y + 7, fill=EDG["yellow"], outline="")
+        self.canvas.create_text(x, y + 34, text=PROP_NAME.upper(), fill=EDG["yellow"], font=(self.body_font, 11, "bold"))
 
     def draw_players(self, screen):
         now = time.time()
-        colors = {101: "#ff6b35", 102: "#4dc3ff"}
+        colors = {101: EDG["orange"], 102: EDG["cyan"]}
         for player_id, player in sorted(self.game.players.items()):
             x, y = screen((player.x, player.y))
-            color = colors.get(player_id, "#d6d6d6") if player.alive else "#777777"
+            color = colors.get(player_id, EDG["silver"]) if player.alive else EDG["slate"]
             if player.shield_until > now:
                 self.draw_shield_cone(screen, player)
-            self.canvas.create_oval(x - 17, y - 17, x + 17, y + 17, fill=color, outline="#0b0e11", width=2)
+            self.canvas.create_oval(x - 17, y - 17, x + 17, y + 17, fill=color, outline=EDG["void"], width=2)
             self.canvas.create_oval(x - 26, y - 26, x + 26, y + 26, outline=color, width=2)
             dx, dy = yaw_to_vec(player.yaw_deg)
-            self.canvas.create_line(x, y, x + dx * 45, y - dy * 45, fill="#f2efe8", width=4, arrow=tk.LAST)
-            self.canvas.create_text(x, y - 38, text=player_label(player_id), fill="#f2efe8", font=("Segoe UI", 11, "bold"))
+            self.canvas.create_line(x, y, x + dx * 45, y - dy * 45, fill=EDG["white"], width=4, arrow=tk.LAST)
+            self.canvas.create_text(x, y - 38, text=player_label(player_id).upper(), fill=EDG["white"], font=(self.body_font, 12, "bold"))
 
     def draw_shield_cone(self, screen, player):
         points = [screen((player.x, player.y))]
@@ -1585,82 +1737,44 @@ class MapApp:
             dx, dy = yaw_to_vec(angle)
             points.append(screen((player.x + dx * 1.25, player.y + dy * 1.25)))
         flat = [coord for point in points for coord in point]
-        self.canvas.create_polygon(flat, fill="#183645", outline="#4dc3ff", stipple="gray25")
+        self.canvas.create_polygon(flat, fill=EDG["teal_black"], outline=EDG["cyan"], stipple="gray25")
 
-    def draw_player_panel(self, x, y, w, h, player, player_id, accent):
-        self.canvas.create_rectangle(x, y, x + w, y + h, fill="#16191f", outline="#2a3038")
+    def draw_player_hud(self, x, y, w, h, player, player_id, accent, align):
+        stipple = "gray50"
+        self.canvas.create_rectangle(x + 5, y + 5, x + w + 5, y + h + 5, fill=EDG["navy"], outline="", stipple=stipple)
+        self.canvas.create_rectangle(x, y, x + w, y + h, fill=EDG["void"], outline=accent, width=4, stipple=stipple)
         label = player_label(player_id)
-        self.canvas.create_text(x + 18, y + 18, anchor="nw", text=label, fill=accent, font=("Segoe UI", 20, "bold"))
+        anchor = "nw" if align == "left" else "ne"
+        tx = x + 18 if align == "left" else x + w - 18
+        state_anchor = "nw" if align == "left" else "ne"
+        state_x = x + 202 if align == "left" else x + w - 202
+        self.canvas.create_text(tx, y + 18, anchor=anchor, text=label.upper(), fill=accent, font=(self.title_font, 13))
         if player is None:
-            self.canvas.create_text(x + 18, y + 62, anchor="nw", text="Waiting for spellbook", fill="#8e9aa7", font=("Segoe UI", 11))
+            self.canvas.create_text(state_x, y + 10, anchor=state_anchor, text="WAITING", fill=EDG["steel"], font=(self.body_font, 20, "bold"))
             return
         now = time.time()
-        self.canvas.create_text(x + 18, y + 58, anchor="nw", text=f"Score {player.score_hits}", fill="#f2efe8", font=("Segoe UI", 30, "bold"))
-        self.draw_hp_blocks(x + 18, y + 120, w - 36, player.hp)
-        self.draw_meter(x + 18, y + 184, w - 36, "Mana", player.mana / MAX_MANA, "#2f82ff")
-        cooldown = max(0.0, player.spell_lockout_until - now)
-        self.draw_meter(x + 18, y + 246, w - 36, "Cooldown", min(1.0, cooldown / SPELL_LOCKOUT_SECONDS), "#ff6b35")
         shield = max(0.0, player.shield_until - now)
-        self.draw_meter(x + 18, y + 308, w - 36, "Shield", min(1.0, shield / SHIELD_DURATION_SECONDS), "#4dc3ff")
-        self.canvas.create_text(x + 18, y + 372, anchor="nw", text=f"Yaw {player.yaw_deg:.0f}", fill="#a8b0ba", font=("Segoe UI", 12))
-        self.canvas.create_text(x + 18, y + 398, anchor="nw", text=f"Last {player.last_action}", fill="#d9dedf", font=("Segoe UI", 12, "bold"))
-        state = "DEAD" if not player.alive else ("SHIELD" if shield > 0 else ("COOLDOWN" if cooldown > 0 else "READY"))
-        self.canvas.create_text(x + 18, y + h - 54, anchor="nw", text=state, fill=accent, font=("Segoe UI", 26, "bold"))
+        state = "DEAD" if not player.alive else ("SHIELD" if shield > 0 else ("COOLDOWN" if max(0.0, player.spell_lockout_until - now) > 0 else "READY"))
+        self.canvas.create_text(state_x, y + 10, anchor=state_anchor, text=state, fill=accent, font=(self.body_font, 20, "bold"))
+        self.draw_hp_blocks(x + 18, y + 48, w - 36, player.hp)
+        self.draw_meter(x + 18, y + 92, w - 36, "MANA", player.mana / MAX_MANA, EDG["blue"])
+        cooldown = max(0.0, player.spell_lockout_until - now)
+        self.draw_meter(x + 18, y + 132, w - 36, "COOLDOWN", min(1.0, cooldown / SPELL_LOCKOUT_SECONDS), EDG["orange"])
 
     def draw_hp_blocks(self, x, y, w, hp):
-        self.canvas.create_text(x, y, anchor="nw", text="HP", fill="#a8b0ba", font=("Segoe UI", 11, "bold"))
+        self.canvas.create_text(x, y, anchor="nw", text="HP", fill=EDG["steel"], font=(self.body_font, 13, "bold"))
         block_w = (w - 16) / MAX_HP
         for i in range(MAX_HP):
             bx = x + i * (block_w + 4)
-            fill = "#2ecc71" if i < hp else "#2a3038"
-            self.canvas.create_rectangle(bx, y + 26, bx + block_w, y + 52, fill=fill, outline="#39424d")
+            fill = EDG["green"] if i < hp else EDG["indigo"]
+            self.canvas.create_rectangle(bx, y + 24, bx + block_w, y + 48, fill=fill, outline=EDG["slate"])
 
     def draw_meter(self, x, y, w, label, frac, color):
         frac = max(0.0, min(1.0, frac))
-        self.canvas.create_text(x, y, anchor="nw", text=label, fill="#a8b0ba", font=("Segoe UI", 11, "bold"))
-        self.canvas.create_rectangle(x, y + 24, x + w, y + 42, fill="#0f1216", outline="#39424d")
+        self.canvas.create_text(x, y, anchor="nw", text=label, fill=EDG["steel"], font=(self.body_font, 13, "bold"))
+        self.canvas.create_rectangle(x, y + 22, x + w, y + 40, fill=EDG["navy"], outline=EDG["slate"])
         if frac > 0:
-            self.canvas.create_rectangle(x + 2, y + 26, x + 2 + (w - 4) * frac, y + 40, fill=color, outline="")
-
-    def draw_bottom_bar(self, x, y, w, h):
-        self.canvas.create_rectangle(x, y, x + w, y + h, fill="#16191f", outline="#2a3038")
-        self.canvas.create_text(x + 18, y + 14, anchor="nw", text="Phone Audio", fill="#f2efe8", font=("Segoe UI", 13, "bold"))
-        self.canvas.create_text(x + 18, y + 42, anchor="nw", text=self.phone_url, fill="#4dc3ff", font=("Consolas", 12, "bold"))
-        wifi_text = f"Wi-Fi {self.wifi_ssid}" if self.wifi_ssid else "Wi-Fi QR disabled"
-        self.canvas.create_text(x + 18, y + 70, anchor="nw", text=wifi_text, fill="#a8b0ba", font=("Segoe UI", 10))
-        self.draw_qr(x + 410, y + 16, self.phone_qr, "Audio QR")
-        self.draw_qr(x + 540, y + 16, self.wifi_qr, "Wi-Fi QR")
-        self.canvas.create_text(x + 690, y + 14, anchor="nw", text="Events", fill="#f2efe8", font=("Segoe UI", 13, "bold"))
-        yy = y + 40
-        for event in list(self.game.events)[-5:][::-1]:
-            self.canvas.create_text(x + 690, yy, anchor="nw", text=event.text, fill="#d9dedf", font=("Segoe UI", 10))
-            yy += 20
-
-    def draw_qr(self, x, y, matrix, label):
-        self.canvas.create_text(x, y - 2, anchor="sw", text=label, fill="#a8b0ba", font=("Segoe UI", 9))
-        if not matrix:
-            self.canvas.create_rectangle(x, y, x + 92, y + 92, outline="#39424d")
-            self.canvas.create_text(x + 46, y + 43, text="text only", fill="#6f7882", font=("Segoe UI", 9))
-            return
-        size = 92
-        cells = len(matrix)
-        cell = max(1, size // cells)
-        self.canvas.create_rectangle(x, y, x + cell * cells, y + cell * cells, fill="#f2efe8", outline="#39424d")
-        for row_idx, row in enumerate(matrix):
-            for col_idx, value in enumerate(row):
-                if value:
-                    x0 = x + col_idx * cell
-                    y0 = y + row_idx * cell
-                    self.canvas.create_rectangle(x0, y0, x0 + cell, y0 + cell, fill="#101114", outline="")
-
-    def draw_radio_debug(self, x, y, link_rows):
-        self.canvas.create_text(x, y, anchor="nw", text="Radio", fill="#a8b0ba", font=("Segoe UI", 10, "bold"))
-        y += 20
-        for obs in link_rows[:7]:
-            text = f"{self.node_label(obs.observer_id):>3}->{self.node_label(obs.source_id):<3} {obs.distance_m:3.1f}m {int(obs.confidence * 100):02d}%"
-            color = "#8e9aa7" if obs.confidence >= 0.45 else "#d98763"
-            self.canvas.create_text(x, y, anchor="nw", text=text, fill=color, font=("Consolas", 8))
-            y += 15
+            self.canvas.create_rectangle(x + 2, y + 24, x + 2 + (w - 4) * frac, y + 38, fill=color, outline="")
 
     def node_label(self, node_id):
         if node_id in self.solver.anchors:
@@ -1822,10 +1936,14 @@ def main():
     outgoing = queue.Queue()
     ensure_audio_assets()
     audio_hub = PhoneAudioHub()
+    local_audio = LocalAudioPlayer()
     phone_url = f"http://{args.phone_host}:{args.phone_port}/"
+    site_qr_path = ensure_site_qr(phone_url)
     try:
         PhoneAudioServer(args.phone_bind, args.phone_port, audio_hub).start()
         print(f"Phone audio server: {phone_url}")
+        if site_qr_path:
+            print(f"Site QR image: {site_qr_path}")
     except OSError as exc:
         print(f"Phone audio server failed on {args.phone_bind}:{args.phone_port}: {exc}")
 
@@ -1841,12 +1959,14 @@ def main():
 
     threading.Thread(target=transport.run, daemon=True).start()
 
+    load_dashboard_fonts()
     root = tk.Tk()
     solver = MeshSolver()
     game = GameEngine(
         outgoing,
         simple_combat=args.simple_combat,
         audio_hub=audio_hub,
+        local_audio=local_audio,
         prop_position_getter=lambda: nearest_origin_anchor(solver.anchors),
     )
     threading.Thread(

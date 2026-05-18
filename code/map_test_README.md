@@ -24,7 +24,8 @@ The player sketch still compiles without those OLED libraries, but the OLED scre
 - SSD1306 OLED: address `0x3C`
 - Green health LEDs: GPIO `32, 33, 25, 26, 27`
 - Red effect LEDs: GPIO `16, 17, 18, 19`
-- Power on each player while its controller points arena north. Press `r` in the server dashboard to recenter all yaw readings.
+- Local yaw recenter button: `GPIO23` to `GND`, active-low with ESP32 internal pullup. Hold the spellbook still while pressing it so the firmware can refresh the gyro drift baseline.
+- Power on each player while its controller points arena north. Press the local button or press `r` in the server dashboard to recenter yaw readings.
 
 LED rows for the common 30-pin ESP32 DevKit:
 
