@@ -10,7 +10,16 @@ The Fantasy Field Management System is a hackathon-built physical spell duel. Tw
 
 ## Pictures
 
-Add pictures here
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/f0ab8275-1182-4811-8b3d-6437fd8668c3" />
+
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/b30cc993-f66c-4704-bf36-5bca3aeffbb9" />
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/26770d9e-ce19-467d-82be-fc93d5381443" />
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/c2a63c58-0a0e-414a-aa64-fadfe6b66414" />
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/aac3388f-0f86-46dc-a2dc-0e253a784409" />
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/4f3c06cb-5722-4343-b0e2-e7e227db43d7" />
+
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/f5b9fb55-5402-4142-8f79-550c0da71b3d" />
+
 
 ## What It Does
 
@@ -42,3 +51,4 @@ Scattered around the play area are several fixed field nodes. They work a little
 - [`code/server/static/qr/site_qr.png`](code/server/static/qr/site_qr.png): QR code for the phone audio page.
 - [`code/server/requirements.txt`](code/server/requirements.txt): Python dependencies.
 
+<img width="1331" height="1002" alt="image" src="https://github.com/user-attachments/assets/5dade78c-1c2b-47c8-a340-ec15fd205931" />
